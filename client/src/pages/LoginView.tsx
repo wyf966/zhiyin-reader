@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ApiError } from '../api/client'
 import { useSession } from '../state/session'
@@ -19,8 +19,9 @@ export default function LoginView() {
   const [remember, setRemember] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const { login, register } = useSession()
+  const { login, register, user, recoveryError, retrySession } = useSession()
   const navigate = useNavigate()
+  useEffect(() => { if (user) navigate('/shelf', { replace: true }) }, [user, navigate])
   // 触屏上点阵不会被「划过」，不挂载
   const finePointer = hasFinePointer()
 
@@ -176,6 +177,10 @@ export default function LoginView() {
           </label>
 
           {error && <div className="alert alert-error">{error}</div>}
+          {recoveryError && <div role="status" className="alert alert-error">
+            {recoveryError}
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => void retrySession()}>重试恢复登录</button>
+          </div>}
 
           <button className="btn btn-primary btn-block" disabled={loading}>
             {loading

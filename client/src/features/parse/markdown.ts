@@ -21,6 +21,8 @@ interface MdToken {
   href?: string
   tokens?: MdToken[]
   items?: MdToken[]
+  header?: MdToken[]
+  rows?: MdToken[][]
 }
 
 /** 把行内 token 拼成纯文本；图片 token 返回空串，它由 collectImages 单独收走 */
@@ -61,7 +63,7 @@ function collectImages(
         // 契约说的是"客户端生成的 UUID"，这里取确定性哈希，
         // 好处是懒上传与缓存键在多次解析之间对得上。
         // 带上 paraIndex 是为了让同一张图在同一文档里出现多次时不被主键顶掉。
-        imageId: `img_${sha256Hex(`${src}#${paraIndex}`).slice(0, 12)}`,
+        imageId: `img_${sha256Hex(`${src}#${paraIndex}#${out.length}`).slice(0, 12)}`,
         paraIndex,
         src,
         alt: t.text ?? '',
@@ -113,9 +115,20 @@ export function parseMarkdown(raw: string, fileName: string, author = '未知'):
         break
       }
       case 'blockquote':
+        // 引用内部仍是块级 token，递归收图，纯图片引用也要占段落。
+        push(hasImage(t.tokens) && !inlineText(t.tokens).trim() ? 'img' : 'p', inlineText(t.tokens), t.tokens)
+        break
       case 'code':
         // 引用与代码块统一当正文段落；代码块保留原文
         push('p', t.type === 'code' ? (t.text ?? '') : inlineText(t.tokens))
+        break
+      case 'table':
+        // 阅读器没有表格类型：按行保留单元格文本，图片仍沿用现有图文混排。
+        for (const cells of [t.header ?? [], ...(t.rows ?? [])]) {
+          const from = cells.flatMap(c => c.tokens ?? [])
+          const body = cells.map(c => inlineText(c.tokens)).filter(s => s.trim()).join(' | ')
+          push(!body.trim() && hasImage(from) ? 'img' : 'p', body, from)
+        }
         break
       case 'list':
         for (const item of t.items ?? []) {

@@ -9,7 +9,7 @@
  */
 
 export const DB_NAME = 'zhiyin-cache'
-export const DB_VERSION = 5
+export const DB_VERSION = 6
 
 export const STORE_DOCUMENTS = 'documents'
 export const STORE_IMAGES = 'images'
@@ -52,9 +52,12 @@ export function openCacheDb(): Promise<IDBDatabase | null> {
       if (!db.objectStoreNames.contains(STORE_DOCUMENTS)) {
         db.createObjectStore(STORE_DOCUMENTS, { keyPath: 'key' })
       }
-      // 老版本升上来时只建缺的 store
+      // 旧图片主键没有服务器/读者归属，不能可靠迁移；保留其他缓存和离线队列。
+      if (db.objectStoreNames.contains(STORE_IMAGES) && req.transaction!.objectStore(STORE_IMAGES).keyPath !== 'key') {
+        db.deleteObjectStore(STORE_IMAGES)
+      }
       if (!db.objectStoreNames.contains(STORE_IMAGES)) {
-        const s = db.createObjectStore(STORE_IMAGES, { keyPath: 'imageId' })
+        const s = db.createObjectStore(STORE_IMAGES, { keyPath: 'key' })
         s.createIndex('docId', 'docId', { unique: false })
         s.createIndex('lastAccess', 'lastAccess', { unique: false })
       }

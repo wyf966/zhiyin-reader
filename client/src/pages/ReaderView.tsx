@@ -345,8 +345,8 @@ export default function ReaderView() {
 
   /** 段落号 → 图片引用，渲染 img 段落时按它取图 */
   const imageByPara = useMemo(() => {
-    const m = new Map<number, ContentImageRef>()
-    for (const r of imageRefs) m.set(r.paraIndex, r)
+    const m = new Map<number, ContentImageRef[]>()
+    for (const r of imageRefs) m.set(r.paraIndex, [...(m.get(r.paraIndex) ?? []), r])
     return m
   }, [imageRefs])
 
@@ -769,60 +769,28 @@ export default function ReaderView() {
               />
             )}
             {visibleParagraphs.map((p) => {
-              if (p.type === 'h1' || p.type === 'h2') {
-                const Tag = p.type === 'h1' ? 'h1' : 'h2'
-                return (
-                  <Tag
-                    key={p.paraIndex}
-                    data-para={p.paraIndex}
-                    className={'doc-' + p.type + (flashPara === p.paraIndex ? ' para-flash' : '')}
-                  >
-                    {p.text}
-                  </Tag>
-                )
-              }
-              if (p.type === 'img') {
-                const ref = imageByPara.get(p.paraIndex)
-                if (!ref) {
-                  return (
-                    <figure key={p.paraIndex} data-para={p.paraIndex} className="doc-figure">
-                      <div className="figure-missing">
-                        <span>这一段的图片引用缺失</span>
-                      </div>
-                    </figure>
-                  )
-                }
-                return (
-                  <LazyImage
-                    key={p.paraIndex}
-                    docId={docId}
-                    imageId={ref.imageId}
-                    alt={ref.alt ?? ''}
-                    hasRemote={!!ref.imageUrl}
-                    scrollRoot={rootRef}
-                    keepResident={ra.playing}
-                    dataPara={p.paraIndex}
-                  />
-                )
-              }
-              return (
-                <p
-                  key={p.paraIndex}
-                  data-para={p.paraIndex}
-                  className={'doc-p' + (flashPara === p.paraIndex ? ' para-flash' : '')}
-                >
-                  {(byPara.get(p.paraIndex) ?? []).map((s) => (
-                    <span
-                      key={s.sentenceIndex}
-                      data-sentence={s.sentenceIndex}
-                      className={'sent' + (s.sentenceIndex === ra.cursor ? ' sent-active' : '')}
-                      onClick={() => ra.seek(s.sentenceIndex)}
-                    >
-                      {s.text}
-                    </span>
-                  ))}
-                </p>
-              )
+              const refs = imageByPara.get(p.paraIndex) ?? []
+              const images = refs.map(ref => (
+                <LazyImage key={ref.imageId} docId={docId} imageId={ref.imageId}
+                  alt={ref.alt ?? ''} hasRemote={!!ref.imageUrl} scrollRoot={rootRef}
+                  keepResident={ra.playing} />
+              ))
+              // 同一段可能有多张图，父容器承载锚点与整段高度，避免只记录最后一张图。
+              const block = p.type === 'img'
+                ? (images.length ? images : <figure className="doc-figure"><div className="figure-missing">这一段的图片引用缺失</div></figure>)
+                : p.type === 'h1' || p.type === 'h2'
+                  ? (() => {
+                      const Tag = p.type
+                      return <Tag className={'doc-' + p.type + (flashPara === p.paraIndex ? ' para-flash' : '')}>{p.text}</Tag>
+                    })()
+                  : <p className={'doc-p' + (flashPara === p.paraIndex ? ' para-flash' : '')}>
+                      {(byPara.get(p.paraIndex) ?? []).map(s => (
+                        <span key={s.sentenceIndex} data-sentence={s.sentenceIndex}
+                          className={'sent' + (s.sentenceIndex === ra.cursor ? ' sent-active' : '')}
+                          onClick={() => ra.seek(s.sentenceIndex)}>{s.text}</span>
+                      ))}
+                    </p>
+              return <div key={p.paraIndex} data-para={p.paraIndex}>{block}{p.type !== 'img' && images}</div>
             })}
             {virtual && (
               <div

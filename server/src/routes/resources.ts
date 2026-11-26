@@ -200,7 +200,7 @@ export default async function resourceRoutes(app: FastifyInstance) {
       reply
         .header('Content-Type', found.mime)
         .header('ETag', etag)
-        .header('Cache-Control', 'private, max-age=604800')
+        .header('Cache-Control', 'private, no-cache')
       return reply.send(bytes)
     },
   )

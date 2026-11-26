@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { requireUserId } from '../auth/require'
 import { dal, newId, now } from '../dao'
 import { ApiError, E } from '../errors'
+import { readingBoundaries } from '../readingBoundaries'
 
 /**
  * 阅读时长（R7-5，契约新增 §6.4）。
@@ -26,21 +27,6 @@ interface ReportBody {
 /** 把毫秒转成人看的分钟数。不足 1 分钟也至少给 1，免得满屏都是"已读 0 分钟" */
 function minutes(ms: number): number {
   return ms <= 0 ? 0 : Math.max(1, Math.round(ms / 60000))
-}
-
-function startOfTodayUtc(): string {
-  const d = new Date()
-  d.setUTCHours(0, 0, 0, 0)
-  return d.toISOString()
-}
-
-function startOfWeekUtc(): string {
-  const d = new Date()
-  d.setUTCHours(0, 0, 0, 0)
-  // 周一算一周的开始
-  const dow = (d.getUTCDay() + 6) % 7
-  d.setUTCDate(d.getUTCDate() - dow)
-  return d.toISOString()
 }
 
 export default async function readingTimeRoutes(app: FastifyInstance) {
@@ -115,11 +101,14 @@ export default async function readingTimeRoutes(app: FastifyInstance) {
   )
 
   /* ---------------------------------------- 总览（阅读时长页用） */
-  app.get('/api/reading-time/summary', async (req) => {
+  app.get<{ Querystring: { timeZone?: string } }>('/api/reading-time/summary', async (req) => {
     const userId = requireUserId(req)
 
-    const todayMs = dal.sumReadingMsSince(userId, startOfTodayUtc())
-    const weekMs = dal.sumReadingMsSince(userId, startOfWeekUtc())
+    let boundaries: { today: string; week: string }
+    try { boundaries = readingBoundaries(req.query.timeZone || 'UTC') }
+    catch { throw E.validation(['timeZone']) }
+    const todayMs = dal.sumReadingMsSince(userId, boundaries.today)
+    const weekMs = dal.sumReadingMsSince(userId, boundaries.week)
 
     // 按书分组的结果顺便就是总时长 —— 不必再单独查一次全量 SUM
     const books = []

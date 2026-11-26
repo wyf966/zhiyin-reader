@@ -20,6 +20,7 @@ export interface Book {
   title: string
   author: string
   fileFormat: BookFormat
+  hasOriginalFile?: boolean
   coverImageId: string | null
   paragraphCount: number
   /** 读者收藏了没有（R7-4）。服务端按 (user_id, doc_id) 记 */

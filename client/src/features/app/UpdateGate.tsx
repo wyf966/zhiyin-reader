@@ -14,7 +14,7 @@ import AppLogo from '../brand/AppLogo'
  * 强制更新闸门。
  *
  * 两条路都会把弹窗叫出来：
- *   1. 启动时查 /api/app/version，发现服务端最新版高于本机；
+ *   1. 启动时查 /api/app/version，当前版本低于最低允许版本；
  *   2. 任何接口返回 426 APP_UPDATE_REQUIRED（旧版本没带版本头），
  *      client.ts 会派发 zhiyin:update-required 事件。
  *
@@ -47,7 +47,8 @@ export default function UpdateGate({ children }: Props) {
     fetchLatestVersion(getApiBase())
       .then((latest) => {
         if (!alive) return
-        if (latest.force && latest.versionCode > APP_VERSION_CODE) setInfo(latest)
+        // 与服务端门槛完全一致，force 不得覆盖明确的最低版本。
+        if (latest.minVersionCode > APP_VERSION_CODE || latest.versionCode > APP_VERSION_CODE) setInfo(latest)
       })
       .catch(() => {
         /* 查不到就放行：离线阅读不能被更新检查卡死 */
@@ -97,6 +98,7 @@ export default function UpdateGate({ children }: Props) {
 
   const current = APP_VERSION_NAME === '0.0.0' ? `#${APP_VERSION_CODE}` : APP_VERSION_NAME
   const latest = info.versionName || `#${info.versionCode}`
+  const required = info.minVersionCode > APP_VERSION_CODE
 
   return (
     <>
@@ -118,7 +120,7 @@ export default function UpdateGate({ children }: Props) {
             当前 v{current}　→　最新 v{latest}
           </p>
           <p className="update-note">
-            {info.notes || '本次更新包含界面与稳定性改进，更新后才能继续使用。'}
+            {info.notes || (required ? '当前版本已停止服务，请更新后继续使用。' : '有新版本可用，你可以选择稍后更新。')}
           </p>
           <button
             className="btn btn-primary update-btn"
@@ -127,6 +129,7 @@ export default function UpdateGate({ children }: Props) {
           >
             {opening ? '正在打开下载…' : '立即下载更新'}
           </button>
+          {!required && <button className="btn btn-ghost" onClick={() => setInfo(null)}>稍后更新</button>}
           {/* 万一系统浏览器没被拉起，至少能长按复制这个地址手动下载 */}
           {apkUrl && <p className="update-url">{apkUrl}</p>}
           <p className="update-hint">下载完成后安装，重新打开应用即可继续使用。</p>

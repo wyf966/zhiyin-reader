@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import { requireUserId } from '../auth/require'
 import { dal, now, type DocumentRow } from '../dao'
-import { E } from '../errors'
+import { ApiError, E } from '../errors'
 import { cleanupDocumentResources, withDocumentResourceLock } from './resources'
 
 /** 契约 §4.1：支持的格式 */
@@ -49,6 +49,7 @@ function toListItem(
     title: d.title ?? d.file_name,
     author: d.author ?? '未知',
     fileFormat: d.file_format,
+    hasOriginalFile: !!d.resource_url,
     // 封面要等 R3 抽取图片之后才有，先给 null
     coverImageId: null,
     paragraphCount,
@@ -64,6 +65,32 @@ function toListItem(
 }
 
 export default async function documentRoutes(app: FastifyInstance) {
+  app.get<{ Querystring: { hash?: string } }>('/api/documents/by-hash', async req => {
+    const userId = requireUserId(req)
+    if (!req.query.hash) throw E.validation(['hash'])
+    const doc = dal.getOwnDocumentByHash(userId, req.query.hash)
+    return doc ? { docId: doc.doc_id } : null
+  })
+
+  app.patch<{ Params: { docId: string }; Body: { expectedHash: string; contentHash: string } }>(
+    '/api/documents/:docId/content-hash', {
+      schema: { body: { type: 'object', required: ['expectedHash', 'contentHash'], properties: {
+        expectedHash: { type: 'string', pattern: '^sha256:', maxLength: 256 },
+        contentHash: { type: 'string', pattern: '^sha256-v2:', maxLength: 256 },
+      } } },
+    }, async (req, reply) => {
+      const userId = requireUserId(req)
+      const doc = dal.getDocumentById(req.params.docId)
+      if (!doc) throw E.notFound()
+      if (doc.owner_id !== userId) throw E.forbiddenNotOwner()
+      const duplicate = dal.getOwnDocumentByHash(userId, req.body.contentHash)
+      if (duplicate && duplicate.doc_id !== doc.doc_id) throw E.duplicateDocument(duplicate.doc_id)
+      if (!dal.upgradeContentHash(doc.doc_id, req.body.expectedHash, req.body.contentHash)) {
+        throw new ApiError(409, 'DOCUMENT_CHANGED', '文档已更新，请重试。')
+      }
+      return reply.code(204).send()
+    },
+  )
   /* ---------------------------------------- 契约 §4.4 书架列表与检索 */
   app.get<{
     Querystring: { keyword?: string; category?: string; page?: string; pageSize?: string }
@@ -107,6 +134,7 @@ export default async function documentRoutes(app: FastifyInstance) {
       fileName: doc.file_name,
       fileFormat: doc.file_format,
       fileSize: doc.file_size,
+      contentHash: doc.content_hash,
       importedAt: doc.imported_at,
       paragraphCount: dal.countParagraphs(doc.doc_id),
       imageCount: dal.countImages(doc.doc_id),

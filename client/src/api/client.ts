@@ -207,17 +207,24 @@ async function refreshOnce(): Promise<boolean> {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ refreshToken: rt, deviceId: getDeviceId() }),
       })
+      if (authStore.refresh !== rt) return !!authStore.access
       authStore.set(pair)
       return true
-    } catch {
-      authStore.clear()
-      return false
-    } finally {
-      refreshing = null
+    } catch (e) {
+      // 只有刷新接口明确拒绝令牌才退出；断网、超时和临时故障必须允许重试。
+      if (e instanceof ApiError && e.status === 401) {
+        if (authStore.refresh === rt) authStore.clear()
+        return false
+      }
+      throw e
     }
   })()
 
-  return refreshing
+  try {
+    return await refreshing
+  } finally {
+    refreshing = null
+  }
 }
 
 async function request<T>(
@@ -359,6 +366,7 @@ export interface ContentPage {
 
 /** 契约 §4.5 的文档详情 */
 export interface DocumentDetail {
+  contentHash: string | null
   docId: string
   title: string
   author: string
@@ -620,7 +628,7 @@ export const api = {
 
   /* 阅读时长（契约 §6.4） */
 
-  getReadingSummary: () => request<ReadingSummary>('/reading-time/summary'),
+  getReadingSummary: () => request<ReadingSummary>(`/reading-time/summary?timeZone=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`),
 
   getReadingTime: (docId: string) =>
     request<{ docId: string; totalMs: number; totalMinutes: number }>(
@@ -694,7 +702,8 @@ export const api = {
 
   /** 服务端上没有这张图时抛 code=NOT_FOUND 的 ApiError，调用方据此回退到本地缓存 */
   getImage: async (docId: string, imageId: string): Promise<Blob> => {
-    const res = await requestBinary(`/documents/${docId}/images/${imageId}`)
+    // 图片可以由原文件修复覆盖，必须向服务端验证，不能沿用旧版本的一周 HTTP 缓存。
+    const res = await requestBinary(`/documents/${docId}/images/${imageId}`, { cache: 'no-cache' })
     return res.blob()
   },
 
@@ -710,6 +719,13 @@ export const api = {
     }).then((r) => r.json()),
 
   /* 原始文件（契约 §4.2），R3 暂时只用到上传 */
+
+  getOriginalFile: async (docId: string): Promise<Blob> => (await requestBinary(`/documents/${docId}/file`, {}, true, UPLOAD_TIMEOUT_MS)).blob(),
+
+  findDocumentByHash: (hash: string) => request<{ docId: string } | null>(`/documents/by-hash?hash=${encodeURIComponent(hash)}`),
+
+  upgradeContentHash: (docId: string, expectedHash: string, contentHash: string) =>
+    request<void>(`/documents/${docId}/content-hash`, { method: 'PATCH', body: JSON.stringify({ expectedHash, contentHash }) }),
 
   putOriginalFile: (
     docId: string,

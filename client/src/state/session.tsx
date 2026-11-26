@@ -1,11 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
-import { api, type UserInfo } from '../api/client'
+import { ApiError, api, type UserInfo } from '../api/client'
 import { authStore } from '../api/authStore'
 
 interface SessionValue {
   user: UserInfo | null
   /** 静默恢复是否已完成。未完成时页面不要急着跳登录页 */
   ready: boolean
+  recoveryError: string
+  retrySession: () => Promise<void>
   login: (account: string, password: string) => Promise<UserInfo>
   register: (account: string, password: string, nickname?: string) => Promise<void>
   logout: () => Promise<void>
@@ -18,40 +20,45 @@ const Ctx = createContext<SessionValue | null>(null)
 export function SessionProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null)
   const [ready, setReady] = useState(false)
+  const [recoveryError, setRecoveryError] = useState('')
+
+  const retrySession = useCallback(async () => {
+    if (!authStore.refresh) return
+    let expectedAccess = authStore.access
+    let expectedRefresh = authStore.refresh
+    try {
+      if (await api.silentLogin()) {
+        const token = authStore.access
+        expectedAccess = token
+        expectedRefresh = authStore.refresh
+        const me = await api.me()
+        if (authStore.access !== token) return
+        authStore.setUser(me.userId)
+        setUser(me)
+        setRecoveryError('')
+      }
+    } catch (e) {
+      // 恢复期间可能已经手动登录或退出，迟到的失败不能清除新会话。
+      if (authStore.access !== expectedAccess || authStore.refresh !== expectedRefresh) return
+      if (e instanceof ApiError && e.status === 401) authStore.clear()
+      else setRecoveryError('暂时无法恢复登录，登录凭据已保留。网络恢复后可重试。')
+    } finally {
+      setReady(true)
+    }
+  }, [])
 
   /**
    * 刷新页面后 accessToken（在内存里）丢了，但 localStorage 里还有刷新令牌。
    * 这里静默换一次新的访问令牌，再取用户信息，把登录态恢复出来。
    */
   useEffect(() => {
-    let alive = true
-    ;(async () => {
-      try {
-        if (authStore.refresh && (await api.silentLogin())) {
-          const me = await api.me()
-          if (alive) {
-            // 注意把 avatarUrl 一起带上：漏了的话全局都拿不到头像，
-            // 而且不报错 —— 只是所有头像位置都空着
-            setUser({
-              userId: me.userId,
-              account: me.account,
-              nickname: me.nickname,
-              avatarUrl: me.avatarUrl,
-            })
-            // 离线队列按读者隔离，oneClickSync 不是 hook，从 authStore 取
-            authStore.setUser(me.userId)
-          }
-        }
-      } catch {
-        authStore.clear()
-      } finally {
-        if (alive) setReady(true)
-      }
-    })()
+    void retrySession().finally(() => setReady(true))
+    const online = () => { if (!authStore.userId) void retrySession() }
+    window.addEventListener('online', online)
     return () => {
-      alive = false
+      window.removeEventListener('online', online)
     }
-  }, [])
+  }, [retrySession])
 
   const login = useCallback(async (account: string, password: string) => {
     const r = await api.login({ account, password })
@@ -99,7 +106,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <Ctx.Provider value={{ user, ready, login, register, logout, refreshUser }}>
+    <Ctx.Provider value={{ user, ready, recoveryError, retrySession, login, register, logout, refreshUser }}>
       {children}
     </Ctx.Provider>
   )

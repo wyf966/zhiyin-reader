@@ -445,7 +445,9 @@ export class DataAccessLibrary {
     const rows = db
       .prepare(
         `SELECT d.* FROM T_Document d WHERE ${where}
-         ORDER BY d.imported_at DESC LIMIT ? OFFSET ?`,
+         ORDER BY ${opts.category === 'recent'
+           ? '(SELECT MAX(pr.updated_at) FROM T_ReadingProgress pr WHERE pr.doc_id = d.doc_id AND pr.user_id = d.owner_id) DESC,'
+           : ''} d.imported_at DESC, d.doc_id ASC LIMIT ? OFFSET ?`,
       )
       .all(...params, opts.pageSize, (opts.page - 1) * opts.pageSize) as DocumentRow[]
 
@@ -457,6 +459,11 @@ export class DataAccessLibrary {
       .prepare('SELECT COUNT(*) AS n FROM T_ImageResource WHERE doc_id = ?')
       .get(docId) as { n: number }
     return row.n
+  }
+
+  upgradeContentHash(docId: string, expected: string, hash: string): boolean {
+    return getDb().prepare('UPDATE T_Document SET content_hash = ? WHERE doc_id = ? AND content_hash = ?')
+      .run(hash, docId, expected).changes === 1
   }
 
   /* ---- 收藏（R7-4） ---- */

@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState, type RefObject } from 'react'
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { ApiError, api } from '../../api/client'
-import { cacheGet, cachePut, objectUrl, releaseObjectUrl } from './imageCache'
+import { useSession } from '../../state/session'
+import { assertImageScope, cacheEntry, cachePut, imageScope, markUploaded } from './imageCache'
+import { restoreImages } from './restoreImages'
 
 /**
  * 单张图片的按需加载。
@@ -17,7 +19,7 @@ import { cacheGet, cachePut, objectUrl, releaseObjectUrl } from './imageCache'
 type State =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'ready'; url: string; fromCache: boolean }
+  | { kind: 'ready'; url: string; fromCache: boolean; warning?: string }
   | { kind: 'missing' }
   | { kind: 'error'; message: string }
 
@@ -39,92 +41,84 @@ export default function LazyImage({
   docId,
   imageId,
   alt,
-  hasRemote,
   scrollRoot,
   keepResident = false,
   dataPara,
 }: Props) {
   const [state, setState] = useState<State>({ kind: 'idle' })
   const holderRef = useRef<HTMLDivElement>(null)
-  const uploadedRef = useRef(hasRemote)
+  const { user } = useSession()
+  const scope = useMemo(() => imageScope(docId), [docId, user?.userId])
   const startedRef = useRef(false)
+  const generation = useRef(0)
+  const ownedUrl = useRef<string | null>(null)
 
-  /* 懒加载：进入视口（提前 200px）才开始取图 */
+  function release() {
+    generation.current++
+    if (ownedUrl.current) URL.revokeObjectURL(ownedUrl.current)
+    ownedUrl.current = null
+    startedRef.current = false
+  }
+
+  async function load(selected?: File) {
+    release()
+    startedRef.current = true
+    const run = generation.current
+    setState({ kind: 'loading' })
+    try {
+      let restored = selected ? await restoreImages(scope, selected) : undefined
+      let row = await cacheEntry(scope, imageId)
+      let warning = ''
+      if (!row?.fromOriginal && !restored) {
+        try { restored = await restoreImages(scope) }
+        catch (e) {
+          if (!(e instanceof ApiError && e.code === 'ORIGINAL_FILE_MISSING')) throw e
+          warning = e.message
+        }
+        row = await cacheEntry(scope, imageId)
+      }
+      const original = restored?.get(imageId)
+      let blob = original ?? row?.blob
+      if (!blob) {
+        blob = await api.getImage(docId, imageId)
+        assertImageScope(scope)
+        await cachePut(scope, imageId, blob, false)
+      }
+      assertImageScope(scope)
+      if (generation.current !== run) return
+      // 每个组件独立持有 URL；别的文档或同图的另一处引用不能撤销它。
+      ownedUrl.current = URL.createObjectURL(blob)
+      setState({ kind: 'ready', url: ownedUrl.current, fromCache: !!row, warning })
+      if (original || row?.needsUpload) {
+        try {
+          assertImageScope(scope)
+          await api.putImage(docId, imageId, blob)
+          await markUploaded(scope, imageId)
+        } catch { /* 本地仍可显示，保留 needsUpload，下次进入视口再补传。 */ }
+      }
+    } catch (e) {
+      if (generation.current !== run) return
+      setState({ kind: 'error', message: e instanceof Error ? e.message : '图片加载失败' })
+    }
+  }
+
   useEffect(() => {
     const el = holderRef.current
     if (!el) return
-
-    const io = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting && !startedRef.current) {
-            startedRef.current = true
-            void load()
-          } else if (!e.isIntersecting && startedRef.current && !keepResident) {
-            // 离开视口：释放对象地址（IndexedDB 副本保留）
-            releaseObjectUrl(imageId)
-          }
+    const io = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        if (entry.isIntersecting && !startedRef.current) void load()
+        else if (!entry.isIntersecting && startedRef.current && !keepResident) {
+          release()
+          setState({ kind: 'idle' })
         }
-      },
-      { root: scrollRoot.current ?? null, rootMargin: '200px 0px', threshold: 0.01 },
-    )
+      }
+    }, { root: scrollRoot.current ?? null, rootMargin: '200px 0px', threshold: 0.01 })
     io.observe(el)
-    return () => io.disconnect()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [docId, imageId, keepResident])
+    return () => { io.disconnect(); release() }
+  }, [scope, imageId, keepResident])
 
-  async function load() {
-    setState({ kind: 'loading' })
-    try {
-      // 1) 本地缓存
-      const cached = await cacheGet(imageId)
-      if (cached) {
-        setState({ kind: 'ready', url: objectUrl(imageId, cached), fromCache: true })
-        void ensureUploaded(cached)
-        return
-      }
-
-      // 2) 服务端
-      try {
-        const blob = await api.getImage(docId, imageId)
-        await cachePut(docId, imageId, blob)
-        setState({ kind: 'ready', url: objectUrl(imageId, blob), fromCache: false })
-        return
-      } catch (e) {
-        if (e instanceof ApiError && e.code === 'NOT_FOUND') {
-          // 服务端还没有，本地也没有 —— 契约 §4.3 的"图片不可用"占位
-          setState({ kind: 'missing' })
-          return
-        }
-        throw e
-      }
-    } catch (e) {
-      setState({
-        kind: 'error',
-        message: e instanceof ApiError ? e.message : '图片加载失败',
-      })
-    }
-  }
-
-  /** 本地有、服务端没有时补传一次（失败不影响显示） */
-  async function ensureUploaded(blob: Blob) {
-    if (uploadedRef.current) return
-    uploadedRef.current = true
-    try {
-      await api.putImage(docId, imageId, blob)
-    } catch {
-      // 补传失败就把标记放回去，下次进入视口再试
-      uploadedRef.current = false
-    }
-  }
-
-  // 组件卸载时释放
-  useEffect(() => () => releaseObjectUrl(imageId), [imageId])
-
-  const retry = () => {
-    startedRef.current = false
-    void load()
-  }
+  const retry = () => { void load() }
 
   return (
     <figure className="doc-figure" data-para={dataPara}>
@@ -132,6 +126,16 @@ export default function LazyImage({
         {state.kind === 'ready' && (
           <img className="figure-img" src={state.url} alt={alt} />
         )}
+        {state.kind === 'ready' && state.warning && <div className="figure-missing-hint">
+          {state.warning}
+          <label className="btn btn-ghost btn-sm">选择原 EPUB 恢复插图
+            <input type="file" accept=".epub" hidden onChange={e => {
+              const file = e.target.files?.[0]
+              e.target.value = ''
+              if (file) void load(file)
+            }} />
+          </label>
+        </div>}
 
         {(state.kind === 'idle' || state.kind === 'loading') && (
           <div className="figure-skeleton" aria-label="图片加载中">
@@ -154,6 +158,14 @@ export default function LazyImage({
             <button className="btn btn-ghost btn-sm" onClick={retry}>
               重试
             </button>
+            <label className="btn btn-ghost btn-sm">
+              选择原 EPUB 恢复插图
+              <input type="file" accept=".epub" hidden onChange={e => {
+                const file = e.target.files?.[0]
+                e.target.value = ''
+                if (file) void load(file)
+              }} />
+            </label>
           </div>
         )}
       </div>

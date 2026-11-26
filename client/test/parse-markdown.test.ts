@@ -1,6 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import { parseMarkdown } from '../src/features/parse/markdown'
 
+it('同段重复引用同图具有不同且稳定的图片 ID', () => {
+  const raw = '![甲](a.png) ![乙](a.png)'
+  const a = parseMarkdown(raw, '书.md')
+  expect(a.imageRefs).toHaveLength(2)
+  expect(new Set(a.imageRefs.map(r => r.imageId)).size).toBe(2)
+  expect(a.imageRefs).toEqual(parseMarkdown(raw, '书.md').imageRefs)
+})
+
+it('表格逐行保留文本和图片，引用中的图片也保留', () => {
+  const r = parseMarkdown('| 名称 | 图片 |\n| --- | --- |\n| **甲** | ![图](a.png) |\n\n> ![引用](a.png)', '表.md')
+  expect(r.paragraphs.map(p => p.text)).toEqual(['名称 | 图片', '甲', ''])
+  expect(r.imageRefs).toHaveLength(2)
+})
+
 /**
  * PA-06 ~ PA-08、D-01：Markdown 解析。
  *

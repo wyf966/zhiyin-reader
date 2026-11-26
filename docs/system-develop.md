@@ -15,7 +15,7 @@
 | 版本 | 客户端与服务端 `1.8.0`；Android 壳的 `versionCode / versionName` 由 CI 从 git tag 算出（本机默认 10 / 1.9.0） |
 | 功能 | 导入解析、图文混排、逐句跟读、跨设备同步与冲突、收藏、阅读时长、头像、书签排序与总览、网页 / 原生更新提示、一键同步、GitHub Releases 分发与自更新 |
 | 数据库 | 13 张表，权威定义 `server/sql/schema.sql` |
-| 测试 | 服务端 277 项 + 客户端 228 项 + 端到端 47 项 = **552 项** |
+| 测试 | 服务端 284 项 + 客户端 241 项 + 端到端 64 项 = **589 项** |
 | 技术栈 | React 18 + Vite + TypeScript；Fastify 4 + better-sqlite3；SQLite |
 | 运行环境 | Node.js 20+；桌面浏览器窗口 ≥ 1280px |
 | 演示服务器 | **已停用**（原 `123.56.172.230`）；本地或自建服务器运行，见 §2.1 |
@@ -236,7 +236,7 @@ server/
 - 自签 HS256 JWT，用 `node:crypto`，**没有引入 jsonwebtoken**。
 - 口令用 `node:crypto` 的 scrypt 加盐哈希。
 - 刷新令牌是 256 位随机串，以 SHA-256 哈希存 `T_Token`；**每次刷新即轮换，旧的立即删除**。
-- accessToken 只在内存，refreshToken 在 localStorage；刷新页面由 `SessionProvider` 静默换新。
+- accessToken 只在内存，refreshToken 在 localStorage；刷新页面由 `SessionProvider` 静默换新。网络错误、超时、429、5xx 保留令牌，刷新接口明确返回 401 才清理。联网事件或登录页「重试恢复登录」可重新恢复会话。
   这是课程设计取舍，生产环境应放 httpOnly Cookie。
 - 连续失败 5 次锁 15 分钟；登录失败不区分「账号不存在」和「密码错误」。
 - 种子数据的口令必须用 `server/src/auth/password.ts` 的 `hashPassword` 生成真实哈希。
@@ -253,6 +253,10 @@ server/
 ### 4.3 解析与内容哈希
 
 - 解析全部在 `client/src/features/parse/`，服务端不做解析（裁决 1）。
+- EPUB 使用 `sha256-v2:`：旧正文/路径摘要与按引用顺序排列的图片二进制 SHA256 摘要共同计算。同路径换图可以重新导入，ZIP 时间戳变化不会影响判定。
+- 旧 `sha256:` EPUB 在重导时按旧摘要定位候选，由前端下载原文件重新解析，通过 `PATCH /api/documents/:docId/content-hash` 条件升级；原文件缺失则无法可靠判重，允许新导入。TXT/Markdown 保留原哈希。
+- Markdown 每次图片引用都有稳定且唯一的 ID；表格按行保留文本和图片，阅读器展示同段所有图片。
+- 原文件上传完成后才显示「导入完成」。失败显示「正文已导入，原文件上传失败」并支持原地补传；刷新后可从书架「选择原文件补传」，校验内容匹配再上传，不重新建书。
 - 句子在前端切分，随段落上传；切分规则见 system-design 6.3。
 - `client/src/features/parse/sha256.ts` 是纯 JS SHA-256，**不要换成 `crypto.subtle`**：
   平板通过局域网 http 访问时它不可用。
@@ -261,6 +265,9 @@ server/
 ### 4.4 图片
 
 - 导入时图片 Blob 只写 IndexedDB（`features/render/imageCache.ts`），二进制不随导入上传。
+- 图片键为 `[完整 API 基址, userId, docId, imageId]`。IndexedDB v6 只重建旧图片 store：旧记录没有可靠读者/服务器归属，不能沿用；音频、正文、离线队列不清空。
+- 缓存缺失时先从保存的原 EPUB 恢复，校验内容哈希后写入隔离缓存。恢复图片标记待补传，进入视口后覆盖服务端可能的错图。缺少原文件时允许读取已有服务端副本并提示无法核验，读者可重新选择原 EPUB 恢复。
+- object URL 由每个图片组件独立持有、撤销，不能按 imageId 跨组件共用。图片 HTTP 缓存每次验证 ETag，修复副本后不会继续读取一周旧缓存。
 - 阅读时首次进入视口才 `PUT` 上去；服务端落 `server/data/images/`，前端一律经服务端取。
 - 离开视口撤销由 `LazyImage` 持有的 object URL；IndexedDB 副本保留。
 - 上限：单文档 300 张或总量 200MB（先到者为准），按最后访问时间 LRU 淘汰。
@@ -341,7 +348,7 @@ server/
 
 - `vite.config.ts` 每次构建注入 `<meta name="zhiyin-build">`；网页更新提示比较它。
 - `UpdateGate` 只在 Capacitor 原生壳生效；检查失败放行，不阻断离线阅读。
-- 原生请求带 `X-App-Version-Code`，服务端低于 `MIN_APP_VERSION_CODE` 返回 426。
+- 原生请求带 `X-App-Version-Code`，服务端低于 `MIN_APP_VERSION_CODE` 返回 426。启动强制弹窗同样只看 `minVersionCode`；低于最新版但仍被允许时提供「稍后更新」。
 - `oneClickSync.ts` 只补报 progress / bookmark；readingTime 由 `useReadingTime` 自己补报。
 - 一次点击一个幂等键前缀（`all_<runId>_p_<docId>` / `_b_<docId>`），重试不会重复落库。
 
@@ -598,3 +605,9 @@ CI（GitHub Actions）三个 job 并行：`static`（两端类型检查 + 前端
 4. 改了接口 / 表结构 / 关键流程，同步更新对应章节与「变更登记」。
 5. 改了实现约定，先在本文对应小节留注释说明「为什么」，再改代码。
 6. 文档里的测试数字以实际跑出来的结果为准，不要沿用历史快照。
+
+## 阅读统计与最近阅读
+
+`GET /api/reading-time/summary?timeZone=<IANA 时区>` 按读者时区计算当天零点与周一零点，支持夏令时；旧客户端未传时区时保留 UTC，非法时区返回 400。新版客户端发送浏览器系统时区。跨日会话仍按开始日期归类。
+
+「最近阅读」按当前读者跨设备 `MAX(T_ReadingProgress.updated_at)` 降序；同时间按导入时间、docId 稳定排序，分页与搜索沿用原查询。

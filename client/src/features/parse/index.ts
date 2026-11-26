@@ -25,6 +25,7 @@ export interface ParseOutcome {
   summary: string
   /** EPUB 抽出来的图片，导入成功后由调用方写进 IndexedDB 缓存 */
   imageBlobs?: Map<string, Blob>
+  legacyContentHash?: string
 }
 
 /**
@@ -90,7 +91,16 @@ export async function parseFile(file: File): Promise<ParseOutcome> {
     throw new Error('这个文件里没有解析出任何段落，请确认文件内容。')
   }
 
-  const contentHash = `sha256:${hashContent(result)}`
+  const legacyContentHash = `sha256:${hashContent(result)}`
+  // 路径相同不能代表资源相同。摘要按引用顺序组合，避免 ZIP 时间戳影响去重。
+  const imageDigests: string[] = []
+  for (const ref of result.imageRefs) {
+    const blob = imageBlobs?.get(ref.imageId)
+    imageDigests.push(blob ? sha256Hex(new Uint8Array(await blob.arrayBuffer())) : 'missing')
+  }
+  const contentHash = format === 'EPUB'
+    ? `sha256-v2:${sha256Hex(JSON.stringify([legacyContentHash, imageDigests]))}`
+    : legacyContentHash
 
   const payload: ImportPayload = {
     fileName: file.name,
@@ -128,6 +138,7 @@ export async function parseFile(file: File): Promise<ParseOutcome> {
     // 编码说明在前、自查告警在后：两处是各自独立加的，都要带上
     summary: `${payload.paragraphs.length} 段 · ${sentenceCount} 句${imagePart} · ${format}${encPart}${notePart}`,
     imageBlobs,
+    legacyContentHash: format === 'EPUB' ? legacyContentHash : undefined,
   }
 }
 
@@ -156,10 +167,7 @@ function sanityNotes(paragraphs: ParseResult['paragraphs']): string[] {
 /**
  * 内容哈希，用于导入去重（docs/system-design.md §5.3、(owner_id, content_hash) 联合唯一）。
  *
- * 文档写的是"EPUB 按 spine 顺序拼接各章节正文与资源内容后计算 SHA-256"。
- * 这里**没有把图片逐字节算进去**，用的是正文 + 图片在包内的路径：
- * 图片是二进制，纯 JS 逐字节哈希大图代价过高，而路径对同一份文件是稳定的，
- * 去重的实际效果不受影响。这一点与 docs/system-design.md §5.3 的措辞有出入，已在交付说明里记明。
+ * 保留旧算法作为迁移定位键。EPUB 的新哈希还会组合图片二进制摘要。
  */
 function hashContent(result: ParseResult): string {
   const text = result.paragraphs.map((p) => normalizeText(p.text).trim()).join('\n')

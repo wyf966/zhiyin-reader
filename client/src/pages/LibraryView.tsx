@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { useNavigate } from 'react-router-dom'
 import { ApiError, api, type BookmarkDto } from '../api/client'
 import { parseFile } from '../features/parse'
-import { cachePut } from '../features/render/imageCache'
+import { assertImageScope, imageScope } from '../features/render/imageCache'
+import { cacheParsedImages, migrateLegacyHash } from '../features/render/restoreImages'
 import UserAvatar from '../features/profile/UserAvatar'
 import LineIcon, { type LineIconName } from '../features/brand/LineIcon'
 import { usePointerGlow } from '../features/motion/usePointerGlow'
@@ -25,6 +26,7 @@ type ImportStage =
   | { kind: 'parsing'; fileName: string }
   | { kind: 'uploading'; fileName: string }
   | { kind: 'done'; fileName: string; summary: string; docId: string }
+  | { kind: 'partial'; fileName: string; summary: string; docId: string; file: File; message: string }
   | { kind: 'error'; fileName: string; message: string; duplicateDocId?: string }
 
 /**
@@ -125,6 +127,7 @@ export default function LibraryView() {
   const [confirmBatch, setConfirmBatch] = useState(false)
 
   const fileRef = useRef<HTMLInputElement>(null)
+  const supplementDoc = useRef<string | null>(null)
   const navigate = useNavigate()
   const { user, ready, logout } = useSession()
 
@@ -491,26 +494,25 @@ export default function LibraryView() {
   }
 
   async function importFile(file: File) {
+    const scope = imageScope('import')
     setStage({ kind: 'parsing', fileName: file.name })
     try {
-      const { payload, summary, imageBlobs } = await parseFile(file)
+      const parsed = await parseFile(file)
+      const { payload, summary, legacyContentHash } = parsed
+      assertImageScope(scope)
+      await migrateLegacyHash(scope, legacyContentHash)
       setStage({ kind: 'uploading', fileName: file.name })
 
       const r = await api.importDocument(payload)
-
-      // 契约 §4.2：把原始文件也传上去，换设备后不必重新选本地文件。
-      // 失败不影响导入本身 —— 文档标记为"仅本地可见"（resource_url 为空），
-      // 下次导入同名文件时会命中去重，不会重复建条目。
-      void api.putOriginalFile(r.docId, file).catch(() => {
-        /* 上传失败就维持"仅本地可见" */
-      })
-
-      // EPUB 抽出来的图片先落到本地缓存（IndexedDB）。
-      // 二进制本体不上传——按契约 §4.3 由阅读时首次进入视口再懒上传。
-      if (imageBlobs?.size) {
-        for (const [imageId, blob] of imageBlobs) {
-          await cachePut(r.docId, imageId, blob)
-        }
+      assertImageScope(scope)
+      await cacheParsedImages({ ...scope, docId: r.docId }, parsed)
+      try {
+        await api.putOriginalFile(r.docId, file)
+      } catch (e) {
+        setStage({ kind: 'partial', fileName: file.name, summary, docId: r.docId, file,
+          message: e instanceof Error ? e.message : '上传失败，请重试。' })
+        await load()
+        return
       }
 
       setStage({ kind: 'done', fileName: file.name, summary, docId: r.docId })
@@ -537,10 +539,50 @@ export default function LibraryView() {
     }
   }
 
+  async function retryOriginal() {
+    if (stage.kind !== 'partial') return
+    const pending = stage
+    setStage({ kind: 'uploading', fileName: pending.fileName })
+    try {
+      await api.putOriginalFile(pending.docId, pending.file)
+      setStage({ kind: 'done', fileName: pending.fileName, summary: pending.summary, docId: pending.docId })
+      await load()
+    } catch (e) {
+      setStage({ ...pending, message: e instanceof Error ? e.message : '上传失败，请重试。' })
+    }
+  }
+
   async function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
+    const target = supplementDoc.current
+    supplementDoc.current = null
+    if (target) {
+      const scope = imageScope(target)
+      setStage({ kind: 'parsing', fileName: file.name })
+      try {
+        const parsed = await parseFile(file)
+        const doc = await api.getDocument(target)
+        assertImageScope(scope)
+        const hash = doc.contentHash?.startsWith('sha256-v2:') ? parsed.payload.contentHash : (parsed.legacyContentHash ?? parsed.payload.contentHash)
+        if (doc.fileFormat !== parsed.payload.fileFormat || hash !== doc.contentHash) throw new Error('文件与这本书不匹配，请选择原文件。')
+        await cacheParsedImages(scope, parsed)
+        setStage({ kind: 'uploading', fileName: file.name })
+        try {
+          assertImageScope(scope)
+          await api.putOriginalFile(target, file)
+          setStage({ kind: 'done', fileName: file.name, summary: parsed.summary, docId: target })
+          await load()
+        } catch (e) {
+          setStage({ kind: 'partial', fileName: file.name, summary: parsed.summary, docId: target, file,
+            message: e instanceof Error ? e.message : '原文件补传失败。' })
+        }
+      } catch (e) {
+        setStage({ kind: 'error', fileName: file.name, message: e instanceof Error ? e.message : '原文件补传失败。' })
+      }
+      return
+    }
     await importFile(file)
   }
 
@@ -598,7 +640,7 @@ export default function LibraryView() {
           value={keyword}
           onChange={(e) => { setKeyword(e.target.value); setBookPage(1) }}
         />
-        <button className="btn btn-primary" onClick={() => fileRef.current?.click()}>
+        <button className="btn btn-primary" onClick={() => { supplementDoc.current = null; fileRef.current?.click() }}>
           导入文档
         </button>
         <input
@@ -681,6 +723,11 @@ export default function LibraryView() {
                   </button>
                 </span>
               )}
+              {stage.kind === 'partial' && <span>
+                正文已导入，原文件上传失败：{stage.fileName}。{stage.message}
+                <button className="btn btn-ghost btn-sm" onClick={() => void retryOriginal()}>补传原文件</button>
+                <button className="btn btn-ghost btn-sm" onClick={() => navigate(`/read/${stage.docId}`)}>立即阅读</button>
+              </span>}
               {stage.kind === 'error' && (
                 <span>
                   {stage.message}
@@ -1100,6 +1147,11 @@ export default function LibraryView() {
                         {b.progress ? `已读 ${Math.round(b.progress.percent * 100)}%` : `${b.paragraphCount} 段`}
                       </span>
                     </div>
+                    {b.hasOriginalFile === false && <button className="btn btn-ghost btn-sm" onClick={e => {
+                      e.stopPropagation()
+                      supplementDoc.current = b.docId
+                      fileRef.current?.click()
+                    }}>选择原文件补传</button>}
                   </div>
                 </article>
               ))}
