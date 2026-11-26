@@ -1,13 +1,33 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ApiError, type ContentImageRef, type DocumentDetail } from '../api/client'
+import {
+  ApiError,
+  getApiBase,
+  type AnnotationColor,
+  type AnnotationDto,
+  type ContentImageRef,
+  type DocumentDetail,
+} from '../api/client'
 import type { Paragraph } from '../models/types'
 import { type Sentence } from '../features/readalong/splitSentences'
 import { loadReaderDocument } from '../features/cache/readerDocument'
+import {
+  downloadBookForOffline,
+  formatOfflineStatus,
+  getOfflineBook,
+  removeOfflineBook,
+  type OfflineBookRecord,
+} from '../features/cache/offlineBooks'
 import { useReadAlong } from '../features/readalong/useReadAlong'
+import { listenScopeKey } from '../features/readalong/listenMemory'
 import { useProgress } from '../features/sync/useProgress'
 import { useBookmarks } from '../features/sync/useBookmarks'
 import { useReadingTime } from '../features/sync/useReadingTime'
+import { useAnnotations } from '../features/annotations/useAnnotations'
+import {
+  downloadMarkdownFile,
+  formatBookAnnotationsMarkdown,
+} from '../features/annotations/exportMarkdown'
 import { anchorAt, clampToParagraphs } from '../features/sync/anchor'
 import {
   buildGeometry,
@@ -18,6 +38,12 @@ import {
   totalHeight,
 } from '../features/render/virtualWindow'
 import { tocIndexAt } from '../features/render/toc'
+import { searchInBook } from '../features/render/inBookSearch'
+import {
+  sliceTextSegments,
+  type HighlightSpan,
+  type SearchSpan,
+} from '../features/render/textSegments'
 import { useGoUp } from '../features/app/useGoUp'
 
 /**
@@ -49,12 +75,75 @@ import ThemeToggle from '../features/settings/ThemeToggle'
  */
 const PAGE_OVERLAP = 48
 
+const HIGHLIGHT_COLORS: { id: AnnotationColor; label: string }[] = [
+  { id: 'amber', label: '琥珀黄' },
+  { id: 'sage', label: '竹青绿' },
+  { id: 'ink', label: '靛蓝墨' },
+  { id: 'rose', label: '朱砂红' },
+]
+
+interface PendingSelection {
+  paraIndex: number
+  sentenceIndex: number
+  startOffset: number
+  endOffset: number
+  quote: string
+  top: number
+  left: number
+}
+
+function isEditableTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false
+  const tag = el.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  if (el.isContentEditable) return true
+  return false
+}
+
+/** 计算容器内某个 Range 起点/终点对应的纯文本字符偏移（UTF-16 code unit） */
+function textOffsetInElement(container: HTMLElement, targetNode: Node, targetOffset: number): number | null {
+  if (!container.contains(targetNode)) return null
+  if (targetNode.nodeType === Node.ELEMENT_NODE) {
+    // 若浏览器把锚点落在元素节点上，统计前 targetOffset 个子节点内的文本长度
+    let acc = 0
+    const children = targetNode.childNodes
+    for (let i = 0; i < Math.min(targetOffset, children.length); i++) {
+      acc += children[i].textContent?.length ?? 0
+    }
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+    let before = 0
+    let cur = walker.nextNode()
+    while (cur) {
+      const rel = targetNode.compareDocumentPosition(cur)
+      if (rel & Node.DOCUMENT_POSITION_PRECEDING) {
+        before += cur.textContent?.length ?? 0
+      } else {
+        break
+      }
+      cur = walker.nextNode()
+    }
+    return before + acc
+  }
+
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+  let total = 0
+  let cur = walker.nextNode()
+  while (cur) {
+    if (cur === targetNode) {
+      return total + targetOffset
+    }
+    total += cur.textContent?.length ?? 0
+    cur = walker.nextNode()
+  }
+  return null
+}
+
 export default function ReaderView() {
   const { docId = '' } = useParams()
   const navigate = useNavigate()
   // 顶栏的「返回」和手机的系统返回手势走同一条历史，别各退各的
   const goUp = useGoUp()
-  const { user, ready } = useSession()
+  const { user, ready, offline } = useSession()
   const [searchParams] = useSearchParams()
   const jumpPara = searchParams.get('para')
 
@@ -63,13 +152,20 @@ export default function ReaderView() {
   const loadSequence = useRef(0)
   const [paragraphs, setParagraphs] = useState<Paragraph[]>([])
   const [imageRefs, setImageRefs] = useState<ContentImageRef[]>([])
+  const [fromOffline, setFromOffline] = useState(false)
+  const [offlineRec, setOfflineRec] = useState<OfflineBookRecord | null>(null)
+  const [offlineBusy, setOfflineBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
   const { prefs, setPrefs } = useSettings()
 
   const [tocOpen, setTocOpen] = useState(false)
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [activeHitIndex, setActiveHitIndex] = useState(0)
   const [marksOpen, setMarksOpen] = useState(false)
+  const [marksTab, setMarksTab] = useState<'bookmarks' | 'annotations'>('bookmarks')
   /**
    * 翻页时扫过的那一页（B6）。key 自增，换一次就把元素重挂一遍，
    * 动画从头播 —— 连点两下右侧也能连着卷两次。
@@ -84,25 +180,35 @@ export default function ReaderView() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [toast, setToast] = useState('')
 
+  /** 选区划线悬浮条状态 */
+  const [pendingSel, setPendingSel] = useState<PendingSelection | null>(null)
+  const [selColor, setSelColor] = useState<AnnotationColor>('amber')
+  const [selNoteOpen, setSelNoteOpen] = useState(false)
+  const [selNoteText, setSelNoteText] = useState('')
+  /** 点击已划线片段弹出的批注气泡 */
+  const [activeAnn, setActiveAnn] = useState<{ item: AnnotationDto; top: number; left: number } | null>(null)
+  const [activeAnnNote, setActiveAnnNote] = useState('')
+
   /**
    * 朗读控制条是否收起。
    *
    * 收起是读者的显式动作，所以**不做**"播放中自动展开" —— 播出声音来就自己
    * 弹回去，等于把收起变成一个会自己撤销的开关。跟读在不在跑由胶囊自己报
    * （"跟读中 · 第 N / M 句"），信息不丢。
-   *
-   * 默认 false（可见）：第一次进阅读页该看见的东西不该藏起来。
-   * 不持久化 —— 换个文档、刷新一次就回到可见，这是想要的行为。
    */
   const [barHidden, setBarHidden] = useState(false)
   const restoreBarRef = useRef<HTMLButtonElement>(null)
-  // 收起按钮一点下去自己就卸载了，键盘读者的焦点会掉到 body 上，
-  // 在长文里得按几十次 Tab 才找得回来。把焦点接到胶囊上。
   useEffect(() => {
     if (barHidden) restoreBarRef.current?.focus()
   }, [barHidden])
 
   const rootRef = useRef<HTMLDivElement>(null)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const tocBtnRef = useRef<HTMLButtonElement>(null)
+  const searchBtnRef = useRef<HTMLButtonElement>(null)
+  const settingsBtnRef = useRef<HTMLButtonElement>(null)
+  const marksBtnRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     if (ready && !user) navigate('/login', { replace: true })
@@ -113,12 +219,13 @@ export default function ReaderView() {
     setLoading(true)
     setError('')
     try {
-      const { doc, content, sentences } = await loadReaderDocument(docId)
+      const loaded = await loadReaderDocument(docId)
       if (sequence !== loadSequence.current) return
-      setSentences(sentences)
-      setBook(doc)
-      setParagraphs(content.paragraphs)
-      setImageRefs(content.imageRefs)
+      setSentences(loaded.sentences)
+      setBook(loaded.doc)
+      setParagraphs(loaded.content.paragraphs)
+      setImageRefs(loaded.content.imageRefs)
+      setFromOffline(loaded.fromOffline)
     } catch (e) {
       if (sequence === loadSequence.current) setError(e instanceof ApiError ? e.message : '加载正文失败，请稍后重试。')
     } finally {
@@ -131,22 +238,43 @@ export default function ReaderView() {
     return () => { loadSequence.current++ }
   }, [load, user])
 
+  /** 读取当前书是否已加入本机离线书单 */
+  useEffect(() => {
+    if (!user || !docId) return
+    let alive = true
+    void getOfflineBook(docId)
+      .then((rec) => { if (alive) setOfflineRec(rec) })
+      .catch(() => { if (alive) setOfflineRec(null) })
+    return () => { alive = false }
+  }, [user, docId])
+
+  const memoryKey = useMemo(
+    () => (user && docId ? listenScopeKey(getApiBase(), user.userId, docId) : ''),
+    [user, docId],
+  )
+
   /** 句子由前端切分（docs/system-design.md §7 裁决 1：解析在前端） */
-  /** 跟读编排：引擎选择、游标推进、预加载、降级都在这里面 */
-  const ra = useReadAlong(docId, sentences)
+  /** 跟读编排：引擎选择、游标推进、本机听书记忆、读完本章停与定时停都在这里面 */
+  const ra = useReadAlong(docId, sentences, paragraphs, memoryKey)
+
+  // 读完本章 / 定时到期时给一条清晰的中文提示
+  useEffect(() => {
+    if (!ra.stopNotice) return
+    setToast(ra.stopNotice)
+    ra.clearStopNotice()
+  }, [ra])
 
   /** 阅读进度：打开时恢复到上次位置，滚动时防抖上报（契约 §6） */
-  const prog = useProgress(docId, !!user)
+  const prog = useProgress(docId, !!user && !fromOffline)
 
   /** 书签：单项接口即时读写，冲突走 409 信封（契约 §7） */
-  const bms = useBookmarks(docId, !!user)
+  const bms = useBookmarks(docId, !!user && !fromOffline)
+
+  /** 划线与批注 */
+  const anns = useAnnotations(docId, !!user && !fromOffline)
 
   /**
    * A4：进页时若拉到了未决冲突（或本页当场撞上冲突），自动把对话框弹出来一次。
-   *
-   * ref 保证"每次进页面只自动弹一次"：读者点了「稍后处理」后，conflicts 仍留在
-   * state 里（服务端也还留着未决记录，下次进页还会读到），不设这个闸会反复弹。
-   * 想看时顶栏的「同步冲突」按钮随时能再打开。
    */
   const conflictPrompted = useRef(false)
   useEffect(() => {
@@ -156,7 +284,7 @@ export default function ReaderView() {
   }, [bms.conflicts])
 
   /** 阅读时长：只累计"可见且聚焦"的时间（R7-5，契约 §6.4） */
-  useReadingTime(docId, !!user)
+  useReadingTime(docId, !!user && !fromOffline)
 
   const byPara = useMemo(() => {
     const m = new Map<number, Sentence[]>()
@@ -168,43 +296,44 @@ export default function ReaderView() {
     return m
   }, [sentences])
 
-  /* 打开文档后恢复到上次阅读位置（契约 §6.1 的跨设备续读） */
+  /** 书内搜索命中结果 */
+  const searchResult = useMemo(
+    () => searchInBook(paragraphs, searchQuery),
+    [paragraphs, searchQuery],
+  )
+
+  useEffect(() => {
+    setActiveHitIndex(0)
+  }, [searchQuery])
+
+  /** 按段落索引搜索命中，渲染时 O(1) 查出本段命中区间 */
+  const hitsByPara = useMemo(() => {
+    const m = new Map<number, { start: number; end: number; hitIndex: number }[]>()
+    for (const h of searchResult.hits) {
+      const list = m.get(h.paraIndex)
+      const item = { start: h.start, end: h.end, hitIndex: h.index }
+      if (list) list.push(item)
+      else m.set(h.paraIndex, [item])
+    }
+    return m
+  }, [searchResult.hits])
+
   /** 长文档才启用窗口化渲染 */
   const virtual = paragraphs.length > VIRTUAL_THRESHOLD
-  /*
-   * 高度估算跟字号绑定 —— 字号一变整张几何表就作废，必须重建。
-   * 只改 DOM 上的 font-size 而让 geom 保持旧值的话，估算和实测对不上，
-   * 表现是"跳转落点偏掉几百像素"，而且**不报任何错**。
-   */
   const geom = useMemo(() => buildGeometry(paragraphs, prefs.fontSize), [paragraphs, prefs.fontSize])
   const [win, setWin] = useState({ start: 0, end: VIRTUAL_THRESHOLD })
 
-  /**
-   * 目录条目 = 全部 h1/h2。要在滚动回调之前算出来（那个回调的依赖数组在这里就求值了）。
-   * 必须 useMemo：每次渲染都 filter 出一个新数组的话，滚动回调会每帧重订阅一次。
-   */
   const tocItems = useMemo(
     () => paragraphs.filter((p) => p.type === 'h1' || p.type === 'h2'),
     [paragraphs],
   )
-  /** 当前章节在 tocItems 里的下标；-1 = 还没读到第一个标题 */
   const [activeToc, setActiveToc] = useState(-1)
   const activeTocRef = useRef(-1)
   const tocPanelRef = useRef<HTMLElement>(null)
 
-  /**
-   * 把"当前章节"同步到目录高亮。
-   *
-   * 关键在于**只在真的跨章时才 setState**：滚动回调是 ref 化的（就是为了躲开
-   * 每 16ms 一次的全量重渲染），在那儿无条件 setState 等于把它白写了 ——
-   * 500 段的文档会肉眼可见地卡。
-   */
   const syncActiveToc = useCallback(
     (paraIndex: number) => {
       let next = tocIndexAt(tocItems, paraIndex)
-      // 读到第一个标题**之前**时（正文常有一段卷首语）tocIndexAt 给的是 -1。
-      // 这里按第一张处理：目录里宁可亮着第一章，也不要一条都不亮 ——
-      // 后者看起来像是功能坏了，而不是"你还没读到正文章节"
       if (next < 0 && tocItems.length > 0) next = 0
       if (next === activeTocRef.current) return
       activeTocRef.current = next
@@ -212,11 +341,6 @@ export default function ReaderView() {
     },
     [tocItems],
   )
-
-  // R7-2 的 excerptOf（默认名取正文前 10 个字）与 B4 的 defaultNameFor
-  // （章节标题 · 首句片段）是同一件事的两版规则。这里保留 B4 那版：
-  // 章节标题同时要写进 T_Bookmark.chapter_title 供 B2 的「按章节排序」用，
-  // 两套并存只会让默认名跟列表里的分组对不上。
 
   /** 跳转落点闪一下墨晕（R3）：让人一眼看见"跳到了哪一段" */
   const [flashPara, setFlashPara] = useState(-1)
@@ -234,13 +358,7 @@ export default function ReaderView() {
     (index: number, smooth = true) => {
       const root = rootRef.current
       if (!root) return
-      // 程序化跳转要同步刷新"当前段落"，不能只靠滚动事件的防抖回调 ——
-      // 那个 effect 的依赖里含 prog，而 useProgress 每次渲染都返回新对象，
-      // 于是每次渲染都会清掉待触发的定时器；跳转后没滚动的话 ref 会停在旧值，
-      // 紧接着加的书签就会拿到上一段的锚点、默认名与章节标题。
       currentParaRef.current = index
-      // 跳转不走滚动回调（下面是直接操作 scrollTop 的），不在这里补一下的话
-      // 目录高亮会停在旧章节，直到读者自己滚一下才更新
       syncActiveToc(index)
       flashAt(index)
       if (!virtual) {
@@ -255,12 +373,24 @@ export default function ReaderView() {
     [virtual, geom, syncActiveToc, flashAt],
   )
 
+  /** 跳到第 idx 处搜索命中 */
+  const jumpToSearchHit = useCallback(
+    (idx: number) => {
+      const hits = searchResult.hits
+      if (hits.length === 0) return
+      const wrapped = ((idx % hits.length) + hits.length) % hits.length
+      setActiveHitIndex(wrapped)
+      gotoParagraph(hits[wrapped].paraIndex)
+      ra.stopAutoScroll()
+    },
+    [searchResult.hits, gotoParagraph, ra],
+  )
 
-  /** 当前可见段落号，加书签时用它 */
+  /** 当前可见段落号，加书签与「从当前段开始跟读」都用它 */
   const currentParaRef = useRef(0)
   const resumedRef = useRef(false)
 
-  /** B2：从书架「我的书签」点进来时，定位到锚点段落（只跳一次，不干扰后续滚动） */
+  /** B2：从书架「我的书签 / 我的摘录」点进来时，定位到锚点段落 */
   const jumpedRef = useRef(false)
   useEffect(() => {
     if (jumpedRef.current) return
@@ -273,19 +403,12 @@ export default function ReaderView() {
     if (resumedRef.current) return
     if (!prog.ready || paragraphs.length === 0) return
     resumedRef.current = true
-    // 带 ?para= 时由上面的 effect 负责定位，不再恢复上次位置（否则两个跳转打架）
     if (jumpPara !== null) return
     if (prog.resumeParagraph <= 0) return
     const idx = clampToParagraphs({ ...anchorAt(prog.resumeParagraph) }, paragraphs)
     gotoParagraph(idx, false)
   }, [prog.ready, prog.resumeParagraph, paragraphs, gotoParagraph, jumpPara])
 
-  /**
-   * 正文一到位就先同步一次当前章节。
-   *
-   * 不做的话，读者打开文档后不滚一下，目录里就一条高亮都没有 ——
-   * 上面那个恢复位置的 effect 在"上次读到第 0 段"或新文档时是直接 return 的。
-   */
   useEffect(() => {
     if (paragraphs.length === 0) return
     syncActiveToc(currentParaRef.current)
@@ -295,9 +418,6 @@ export default function ReaderView() {
   useEffect(() => {
     const root = rootRef.current
     if (!root) return
-    // 用 setTimeout 而不是 requestAnimationFrame 做节流：
-    // rAF 只在"可见"时触发（后台标签页会被暂停），而且 jsdom 默认没有它。
-    // 这里只需要"别每像素都算一次"，16ms 的定时器够用且到处都成立。
     let pending = 0
     const onScroll = () => {
       if (pending) return
@@ -306,7 +426,6 @@ export default function ReaderView() {
         const viewport = root.clientHeight || 600
         let idx: number
         if (virtual) {
-          // 窗口化时只能靠几何表算，DOM 里根本没有那些没渲染的段落
           idx = paragraphAt(geom, root.scrollTop + viewport * 0.3)
           setWin(computeWindow(geom, root.scrollTop, viewport, -1))
         } else {
@@ -339,27 +458,21 @@ export default function ReaderView() {
 
   useEffect(() => {
     if (!toast) return
-    const t = window.setTimeout(() => setToast(''), 2400)
+    const t = window.setTimeout(() => setToast(''), 2600)
     return () => window.clearTimeout(t)
   }, [toast])
 
-  /** 段落号 → 图片引用，渲染 img 段落时按它取图 */
   const imageByPara = useMemo(() => {
     const m = new Map<number, ContentImageRef[]>()
     for (const r of imageRefs) m.set(r.paraIndex, [...(m.get(r.paraIndex) ?? []), r])
     return m
   }, [imageRefs])
 
-  /** 窗口化时只取这一段；短文档就是全部 */
   const visibleParagraphs = useMemo(
     () => (virtual ? paragraphs.slice(win.start, win.end + 1) : paragraphs),
     [virtual, paragraphs, win.start, win.end],
   )
 
-  /**
-   * 窗口化时把渲染出来的段落实测高度回写进几何表。
-   * 估算高度和真实排版总有出入，不回写的话滚动位置会越飘越远。
-   */
   useLayoutEffect(() => {
     if (!virtual) return
     const root = rootRef.current
@@ -377,55 +490,152 @@ export default function ReaderView() {
     }
     if (changed) {
       recomputeFrom(geom, win.start)
-      // 让撑高块用上新的偏移；下一轮实测高度与记录一致，不会反复触发
       setWin((w) => ({ ...w }))
     }
   }, [virtual, win, geom])
 
-  /**
-   * 改字号后按"当前段落"重新锚定滚动位置。
-   *
-   * 为什么非做不可：字号一变，视口里那些段落的实际高度就全变了，
-   * 而 root.scrollTop 是个绝对像素值 —— 内容整体变高变矮之后它还停在原处，
-   * 视觉上就是"读着读着突然跳章了"。
-   *
-   * 必须排在上面那个回写 effect **之后**：先把看得见的那几段高度实测回写，
-   * 再拿修正过的偏移去锚定，落点才准。
-   */
   const lastFontRef = useRef(prefs.fontSize)
   useLayoutEffect(() => {
     const root = rootRef.current
     const fontChanged = lastFontRef.current !== prefs.fontSize
     lastFontRef.current = prefs.fontSize
-    // 只在**字号**变化时重锚：段落数组换掉（换文档）是恢复位置那套逻辑的事
     if (!fontChanged || !root) return
 
     const viewport = root.clientHeight || 600
     const idx = currentParaRef.current
-    // 减去 30% 视口高度，让这一段落回原来那条"当前段落"线上，而不是跳到顶端
     const top = Math.max(0, offsetOf(geom, idx) - viewport * 0.3)
     root.scrollTo({ top, behavior: 'auto' })
     if (virtual) setWin(computeWindow(geom, top, viewport, idx))
   }, [prefs.fontSize, geom, virtual])
 
-  /* 目录抽屉：Esc 关掉，以及把当前章节滚进视野 */
+  /* 打开「书内搜索」抽屉时自动聚焦输入框 */
   useEffect(() => {
-    if (!tocOpen && !settingsOpen) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
-      setTocOpen(false)
-      setSettingsOpen(false)
+    if (searchOpen) {
+      searchInputRef.current?.focus()
+      searchInputRef.current?.select()
     }
+  }, [searchOpen])
+
+  /* 全局快捷键与 Esc 逐层收起 + 焦点归还 */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (dialogOpen) return
+
+      // Ctrl/Cmd + F 打开书内搜索（覆盖浏览器默认查找，专注书内上下文检索）
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault()
+        setSearchOpen(true)
+        setTocOpen(false)
+        setMarksOpen(false)
+        setSettingsOpen(false)
+        window.setTimeout(() => {
+          searchInputRef.current?.focus()
+          searchInputRef.current?.select()
+        }, 0)
+        return
+      }
+
+      if (e.key === 'Escape') {
+        if (pendingSel) {
+          setPendingSel(null)
+          setSelNoteOpen(false)
+          return
+        }
+        if (activeAnn) {
+          setActiveAnn(null)
+          return
+        }
+        if (searchOpen) {
+          setSearchOpen(false)
+          searchBtnRef.current?.focus()
+          return
+        }
+        if (tocOpen) {
+          setTocOpen(false)
+          tocBtnRef.current?.focus()
+          return
+        }
+        if (settingsOpen) {
+          setSettingsOpen(false)
+          settingsBtnRef.current?.focus()
+          return
+        }
+        if (marksOpen) {
+          setMarksOpen(false)
+          marksBtnRef.current?.focus()
+          return
+        }
+        return
+      }
+
+      // 输入框或带修饰键时不拦截单键快捷键
+      if (isEditableTarget(e.target) || e.ctrlKey || e.metaKey || e.altKey) return
+
+      if (e.key === '/') {
+        e.preventDefault()
+        setSearchOpen(true)
+        setTocOpen(false)
+        setMarksOpen(false)
+        setSettingsOpen(false)
+        return
+      }
+
+      if (e.key === ' ') {
+        // 焦点落在按钮上时交给原生按钮激活，避免空格既触发按钮又误开关播放
+        if (e.target instanceof HTMLElement && e.target.closest('button, a')) return
+        e.preventDefault()
+        ra.toggle()
+        return
+      }
+
+      if (e.key === 'ArrowLeft' || e.key === '[') {
+        e.preventDefault()
+        ra.prev()
+        return
+      }
+
+      if (e.key === 'ArrowRight' || e.key === ']') {
+        e.preventDefault()
+        ra.next()
+        return
+      }
+
+      const lower = e.key.toLowerCase()
+      if (lower === 't') {
+        e.preventDefault()
+        setTocOpen((v) => !v)
+        setSearchOpen(false)
+        setMarksOpen(false)
+        setSettingsOpen(false)
+        return
+      }
+      if (lower === 'b') {
+        e.preventDefault()
+        setMarksOpen((v) => !v)
+        setTocOpen(false)
+        setSearchOpen(false)
+        setSettingsOpen(false)
+        return
+      }
+      if (lower === 's') {
+        e.preventDefault()
+        setSettingsOpen((v) => !v)
+        setTocOpen(false)
+        setSearchOpen(false)
+        setMarksOpen(false)
+      }
+    }
+
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [tocOpen, settingsOpen])
+  }, [dialogOpen, pendingSel, activeAnn, searchOpen, tocOpen, settingsOpen, marksOpen, ra])
 
-  /* 滚动模式下也能"翻页"：PageUp / PageDown 滚一屏，顺手掀一次纸边（B6）。
-     不然卷角只在"点击翻页"这个模式下看得到，很多人一辈子不会去打开它 */
+  /* 滚动模式下 PageUp / PageDown 滚一屏并带卷角动画 */
   useEffect(() => {
     if (prefs.pageMode !== 'scroll') return
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'PageDown' && e.key !== 'PageUp') return
+      if (isEditableTarget(e.target)) return
       const root = rootRef.current
       if (!root) return
       e.preventDefault()
@@ -444,8 +654,6 @@ export default function ReaderView() {
     if (!panel) return
     const el = panel.querySelector(`[data-toc-index="${activeToc}"]`) as HTMLElement | null
     if (!el) return
-    // 直接设 scrollTop，不用 scrollIntoView —— 后者会往上找到可滚动的祖先，
-    // 把 .reader-scroll 一起滚了，读者会发现自己莫名其妙被带走了
     panel.scrollTop = Math.max(0, el.offsetTop - panel.clientHeight / 2 + el.clientHeight / 2)
   }, [tocOpen, activeToc])
 
@@ -460,8 +668,6 @@ export default function ReaderView() {
     void getBackground().then((blob) => {
       if (!alive) return
       if (!blob) {
-        // IndexedDB 被禁用，或者记录被清掉了。静默把偏好改回"没有背景" ——
-        // 读者只是没看见壁纸，不是操作失败，弹提示反而是噪音
         setPrefs({ bgImageId: null })
         return
       }
@@ -472,7 +678,6 @@ export default function ReaderView() {
     }
   }, [prefs.bgImageId, setPrefs])
 
-  /* object URL 必须显式撤销，否则 Blob 收不回来 */
   useEffect(() => () => releaseBackgroundUrl(), [])
 
   const onPickBackground = useCallback(
@@ -481,7 +686,6 @@ export default function ReaderView() {
       try {
         await putBackground(file)
         setBgName(file.name)
-        // 只有一张背景图，键是固定的；偏好里记的就是它
         setPrefs({ bgImageId: BG_IMAGE_ID })
       } catch (e) {
         setBgError(e instanceof Error ? e.message : '设置背景图失败。')
@@ -497,18 +701,42 @@ export default function ReaderView() {
     setPrefs({ bgImageId: null })
   }, [setPrefs])
 
+  /* ---- 离线下载 / 移除 ---- */
+
+  const onToggleOffline = useCallback(async () => {
+    if (!book || offlineBusy) return
+    setOfflineBusy(true)
+    try {
+      if (offlineRec) {
+        await removeOfflineBook(book.docId)
+        setOfflineRec(null)
+        setToast('已从离线书单移除')
+      } else {
+        const rec = await downloadBookForOffline(book.docId)
+        setOfflineRec(rec)
+        setToast(`已下载离线：${formatOfflineStatus(rec)}`)
+      }
+    } catch (e) {
+      setToast(e instanceof ApiError ? e.message : '离线缓存操作失败，请稍后重试。')
+    } finally {
+      setOfflineBusy(false)
+    }
+  }, [book, offlineRec, offlineBusy])
+
   /* ---- 翻页模式：点左右两侧翻屏 ---- */
 
   const onReaderClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
+      // 点击空白区域收起已打开的批注气泡
+      const t = e.target as HTMLElement
+      if (activeAnn && !t.closest('.ann-popover, [data-ann-id]')) {
+        setActiveAnn(null)
+      }
+
       if (prefs.pageMode !== 'paged') return
       if (e.button !== 0 || e.defaultPrevented) return
 
-      const t = e.target as HTMLElement
-      // 点句子要跳转跟读、点图片重试按钮要重试、点链接要跳转 ——
-      // 这些都不能被翻页吃掉。少了这道守卫，招牌的「点句子跟读」在翻页模式下就废了
-      if (t.closest('.sent, button, a, input, select, textarea, img, figure')) return
-      // 拖着选文字时鼠标抬起也会触发 click，这时候不该翻页
+      if (t.closest('.sent, button, a, input, select, textarea, img, figure, .sel-toolbar, .ann-popover')) return
       const sel = window.getSelection()
       if (sel && !sel.isCollapsed) return
 
@@ -517,9 +745,6 @@ export default function ReaderView() {
       const x = e.clientX - r.left
       const step = root.clientHeight - PAGE_OVERLAP
 
-      // 用 scrollBy 而不是 gotoParagraph：平滑滚动会自然触发上面那个
-      // 节流滚动回调，窗口化零改动继续工作；gotoParagraph 反而会跟动画打架
-      // 页边卷起的那一下跟滚动同时发生，像真的把纸掀过去了（B6）
       if (x > r.width * 0.7) {
         root.scrollBy({ top: step, behavior: 'smooth' })
         curlSeq.current += 1
@@ -530,16 +755,82 @@ export default function ReaderView() {
         setCurl({ dir: 'prev', key: curlSeq.current })
       }
     },
-    [prefs.pageMode],
+    [prefs.pageMode, activeAnn],
   )
 
-  /**
-   * B4：书签默认名 =「章节标题 + 首句片段」（docs/system-design.md §5.3 的要求）。
-   *
-   * 章节标题不需要动解析层——ReaderView 已经拿到带 type: 'h1' | 'h2' 的 paragraphs，
-   * 取锚点段落**之前最近的一个标题段**即可；之前没有就退回文档里第一个标题段，
-   * 再没有就用书名。
-   */
+  /* ---- 划词选中：弹出划线 / 写批注工具条 ---- */
+
+  const onContentMouseUp = useCallback(() => {
+    const sel = window.getSelection()
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+      setPendingSel(null)
+      setSelNoteOpen(false)
+      return
+    }
+
+    const quote = sel.toString().trim()
+    if (!quote) {
+      setPendingSel(null)
+      return
+    }
+
+    const range = sel.getRangeAt(0)
+    const startEl = (
+      range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.startContainer as HTMLElement)
+        : range.startContainer.parentElement
+    )?.closest('p.doc-p') as HTMLElement | null
+    const endEl = (
+      range.endContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.endContainer as HTMLElement)
+        : range.endContainer.parentElement
+    )?.closest('p.doc-p') as HTMLElement | null
+
+    // 只支持单段内划词，避免跨段偏移歧义
+    if (!startEl || startEl !== endEl) {
+      setPendingSel(null)
+      return
+    }
+
+    const paraBox = startEl.closest('[data-para]') as HTMLElement | null
+    const paraIndex = Number(paraBox?.dataset.para ?? -1)
+    if (!Number.isInteger(paraIndex) || paraIndex < 0) return
+
+    const startOffset = textOffsetInElement(startEl, range.startContainer, range.startOffset)
+    const endOffset = textOffsetInElement(startEl, range.endContainer, range.endOffset)
+    if (startOffset === null || endOffset === null || endOffset <= startOffset) return
+
+    const sentEl = (
+      range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.startContainer as HTMLElement)
+        : range.startContainer.parentElement
+    )?.closest('[data-sentence]') as HTMLElement | null
+    const sentenceIndex = Number(sentEl?.dataset.sentence ?? 0)
+
+    const bodyRect = bodyRef.current?.getBoundingClientRect()
+    const rangeRect = range.getBoundingClientRect()
+    if (!bodyRect) return
+
+    const top = Math.max(10, rangeRect.top - bodyRect.top - 52)
+    const left = Math.max(
+      140,
+      Math.min(bodyRect.width - 150, rangeRect.left - bodyRect.left + rangeRect.width / 2),
+    )
+
+    setActiveAnn(null)
+    setSelNoteOpen(false)
+    setSelNoteText('')
+    setPendingSel({
+      paraIndex,
+      sentenceIndex: Number.isFinite(sentenceIndex) ? sentenceIndex : 0,
+      startOffset,
+      endOffset,
+      quote,
+      top,
+      left,
+    })
+  }, [])
+
   const chapterTitleFor = useCallback(
     (paraIndex: number): string => {
       for (let i = Math.min(paraIndex, paragraphs.length - 1); i >= 0; i--) {
@@ -552,17 +843,11 @@ export default function ReaderView() {
     [paragraphs, book],
   )
 
-  /** 首句片段：取锚点段落切分后的第一句，去掉句末标点，超过 20 字截断 */
   const firstSentenceOf = useCallback(
     (paraIndex: number): string => {
       const p = paragraphs[paraIndex]
-      // 标题段本身没有句子（splitSentences 把 h1/h2 排除在外），若锚点正好落在标题段上，
-      // 兜底取 paragraphs[paraIndex].text 会拿到与章节标题一模一样的一串，
-      // 默认名会变成「卷二 · 境界说 · 卷二 · 境界说」。此时不取片段。
       if (p && (p.type === 'h1' || p.type === 'h2')) return ''
       const raw = (byPara.get(paraIndex) ?? [])[0]?.text ?? p?.text ?? ''
-      // 去掉句末标点：默认名是「章节标题 · 首句片段」这种复合名，末尾再挂一个句号读着别扭，
-      // 也与任务书 B4 给出的示例形式一致（任务书示例没有句号）
       const trimmed = raw.replace(/[。．.！!？?；;…]+$/, '')
       return trimmed.length > 20 ? `${trimmed.slice(0, 20)}…` : trimmed
     },
@@ -576,6 +861,74 @@ export default function ReaderView() {
     },
     [chapterTitleFor, firstSentenceOf],
   )
+
+  const saveSelectionAnnotation = useCallback(
+    async (withNote: string | null) => {
+      if (!pendingSel) return
+      if (fromOffline || offline) {
+        setToast('离线模式下暂不支持新增划线，联网后再试。')
+        return
+      }
+      const anchor = {
+        chapterIndex: 0,
+        paragraphIndex: pendingSel.paraIndex,
+        sentenceIndex: pendingSel.sentenceIndex,
+        charOffset: pendingSel.startOffset,
+        scrollOffset: 0,
+      }
+      const created = await anns.add({
+        anchor,
+        endOffset: pendingSel.endOffset,
+        quote: pendingSel.quote,
+        note: withNote,
+        color: selColor,
+        chapterTitle: chapterTitleFor(pendingSel.paraIndex),
+      })
+      window.getSelection()?.removeAllRanges()
+      setPendingSel(null)
+      setSelNoteOpen(false)
+      setSelNoteText('')
+      if (created) {
+        setToast(withNote ? '已保存划线与批注' : '已保存划线')
+      }
+    },
+    [pendingSel, fromOffline, offline, anns, selColor, chapterTitleFor],
+  )
+
+  const onExportBookMarkdown = useCallback(() => {
+    if (!book) return
+    const md = formatBookAnnotationsMarkdown({ title: book.title, author: book.author }, anns.items)
+    downloadMarkdownFile(`${book.title}-摘录`, md)
+    setToast('已导出 Markdown 摘录')
+  }, [book, anns.items])
+
+  const openAnnotationPopover = useCallback(
+    (e: React.MouseEvent<HTMLElement>, annotationId: string) => {
+      e.stopPropagation()
+      const found = anns.items.find((a) => a.annotationId === annotationId)
+      const bodyRect = bodyRef.current?.getBoundingClientRect()
+      if (!found || !bodyRect) return
+      const rect = e.currentTarget.getBoundingClientRect()
+      const top = Math.min(bodyRect.height - 180, Math.max(12, rect.bottom - bodyRect.top + 8))
+      const left = Math.max(
+        150,
+        Math.min(bodyRect.width - 160, rect.left - bodyRect.left + rect.width / 2),
+      )
+      setPendingSel(null)
+      setActiveAnn({ item: found, top, left })
+      setActiveAnnNote(found.note ?? '')
+    },
+    [anns.items],
+  )
+
+  const onPlayFromCurrent = useCallback(() => {
+    const ok = ra.playFromParagraph(currentParaRef.current)
+    if (!ok) {
+      setToast('当前位置附近没有可朗读的正文句子')
+      return
+    }
+    setToast(`已从第 ${currentParaRef.current + 1} 段开始跟读`)
+  }, [ra])
 
   if (!ready || !user || loading) {
     return <div className="reader-page"><div className="shelf-empty">正在加载正文…</div></div>
@@ -601,13 +954,19 @@ export default function ReaderView() {
       <span className="reader-scan" aria-hidden="true" />
       <header className="reader-topbar">
         <button className="btn btn-ghost" onClick={goUp}>返回</button>
-        <div className="reader-title" title={book.title}>{book.title}</div>
-        {/* 三个面板互斥：目录是覆盖式抽屉，书签是推开正文的栏，
-            设置是浮层，同时开会叠在一起 */}
+        <div className="reader-title" title={book.title}>
+          {book.title}
+          {fromOffline && <span className="offline-pill">离线副本</span>}
+        </div>
+        {/* 四个侧栏互斥，同时开不会互相遮挡 */}
         <button
-          className="btn btn-ghost"
+          ref={tocBtnRef}
+          className={'btn btn-ghost' + (tocOpen ? ' is-active' : '')}
+          aria-expanded={tocOpen}
+          title="章节目录（快捷键：T）"
           onClick={() => {
             setTocOpen((v) => !v)
+            setSearchOpen(false)
             setMarksOpen(false)
             setSettingsOpen(false)
           }}
@@ -615,27 +974,60 @@ export default function ReaderView() {
           目录
         </button>
         <button
-          className="btn btn-ghost"
+          ref={searchBtnRef}
+          className={'btn btn-ghost' + (searchOpen ? ' is-active' : '')}
+          aria-expanded={searchOpen}
+          title="书内搜索（快捷键：/ 或 Ctrl+F）"
+          onClick={() => {
+            setSearchOpen((v) => !v)
+            setTocOpen(false)
+            setMarksOpen(false)
+            setSettingsOpen(false)
+          }}
+        >
+          书内搜索
+        </button>
+        <button
+          ref={settingsBtnRef}
+          className={'btn btn-ghost' + (settingsOpen ? ' is-active' : '')}
+          aria-expanded={settingsOpen}
+          title="阅读设置（快捷键：S）"
           onClick={() => {
             setSettingsOpen((v) => !v)
             setTocOpen(false)
+            setSearchOpen(false)
             setMarksOpen(false)
           }}
         >
           设置
         </button>
         <button
-          className="btn btn-ghost"
+          ref={marksBtnRef}
+          className={'btn btn-ghost' + (marksOpen ? ' is-active' : '')}
+          aria-expanded={marksOpen}
+          title="书签与摘录（快捷键：B）"
           onClick={() => {
+            setMarksTab('bookmarks')
             setMarksOpen((v) => !v)
             setTocOpen(false)
+            setSearchOpen(false)
             setSettingsOpen(false)
           }}
         >
           书签{bms.total > 0 ? `（${bms.total}）` : ''}
         </button>
+        {!fromOffline && (
+          <button
+            className="btn btn-ghost"
+            disabled={offlineBusy}
+            onClick={() => void onToggleOffline()}
+            title={offlineRec ? formatOfflineStatus(offlineRec) : '下载正文与插图，断网也能重新打开'}
+          >
+            {offlineBusy ? '下载中…' : offlineRec ? '已离线' : '下载离线'}
+          </button>
+        )}
         <button
-          className="btn btn-ghost btn-conflict"
+          className={'btn btn-ghost btn-conflict' + (bms.conflicts.length > 0 ? ' has-conflict' : '')}
           onClick={() => {
             if (bms.conflicts.length === 0) {
               setToast('当前没有同步冲突')
@@ -647,13 +1039,10 @@ export default function ReaderView() {
           同步冲突
           {bms.conflicts.length > 0 && <span className="badge">{bms.conflicts.length}</span>}
         </button>
-        {/* 昼夜切换提到顶栏：原来埋在「设置」浮层里，读者要翻两层才够得着 */}
         <ThemeToggle />
       </header>
 
-      <div className="reader-body">
-        {/* 背景图层：脱离文档流。放进流里会给每个段落加上 offsetTop，
-            直接把窗口化的几何表和撑高块高度算坏 */}
+      <div className="reader-body" ref={bodyRef}>
         {bgUrl && (
           <div
             className="reader-bg"
@@ -661,8 +1050,6 @@ export default function ReaderView() {
             aria-hidden="true"
           />
         )}
-        {/* 蒙版压一层，否则亮壁纸配深色文字根本看不清。
-            白天用白蒙版、夜晚用黑蒙版，两边的正文对比度都保住 */}
         {bgUrl && (
           <div
             className={'reader-bg-scrim' + (prefs.theme === 'dark' ? ' on' : '')}
@@ -680,7 +1067,10 @@ export default function ReaderView() {
               bgError={bgError}
               onPickBackground={(f) => void onPickBackground(f)}
               onClearBackground={onClearBackground}
-              onClose={() => setSettingsOpen(false)}
+              onClose={() => {
+                setSettingsOpen(false)
+                settingsBtnRef.current?.focus()
+              }}
             />
           </>
         )}
@@ -688,7 +1078,7 @@ export default function ReaderView() {
         {tocOpen && (
           <>
             <div className="toc-mask" onClick={() => setTocOpen(false)} aria-hidden="true" />
-            <aside className="toc-panel drawer" ref={tocPanelRef}>
+            <aside className="toc-panel drawer" ref={tocPanelRef} aria-label="目录">
               <div className="toc-head">目录</div>
               {tocItems.length === 0 && (
                 <p className="muted marks-empty">
@@ -716,14 +1106,114 @@ export default function ReaderView() {
           </>
         )}
 
-        {/* 书签栏用 B 迭代的 BookmarkPanel：分页 / 排序 / 拖动重排都在里面，
-            R7 那版是它的前身（只有一份平铺列表 + 行内重命名），功能是它的子集。
-            桌面端它推开正文；窄屏下 CSS 把它改成覆盖式抽屉（.marks-mask 只在窄屏出现），
-            否则 260px 的侧栏会把手机正文挤没 */}
+        {searchOpen && (
+          <>
+            <div className="toc-mask" onClick={() => setSearchOpen(false)} aria-hidden="true" />
+            <aside className="toc-panel drawer search-panel" aria-label="书内搜索">
+              <div className="toc-head toc-head-row">
+                <span>书内搜索</span>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => {
+                    setSearchOpen(false)
+                    searchBtnRef.current?.focus()
+                  }}
+                >
+                  收起
+                </button>
+              </div>
+              <div className="search-box">
+                <input
+                  ref={searchInputRef}
+                  className="input search-input"
+                  placeholder="输入关键词，回车跳下一处"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && searchResult.hits.length > 0) {
+                      e.preventDefault()
+                      jumpToSearchHit(activeHitIndex + (e.shiftKey ? -1 : 1))
+                    }
+                  }}
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => {
+                      setSearchQuery('')
+                      searchInputRef.current?.focus()
+                    }}
+                  >
+                    清空
+                  </button>
+                )}
+              </div>
+
+              {searchQuery.trim() && (
+                <div className="search-nav-bar">
+                  <span className="muted">
+                    {searchResult.hits.length > 0
+                      ? `第 ${activeHitIndex + 1} / ${searchResult.hits.length} 处${searchResult.truncated ? `（共 ${searchResult.total} 处）` : ''}`
+                      : '未找到匹配内容'}
+                  </span>
+                  <div className="search-nav-btns">
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      disabled={searchResult.hits.length === 0}
+                      onClick={() => jumpToSearchHit(activeHitIndex - 1)}
+                    >
+                      上一处
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      disabled={searchResult.hits.length === 0}
+                      onClick={() => jumpToSearchHit(activeHitIndex + 1)}
+                    >
+                      下一处
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {!searchQuery.trim() && (
+                <p className="muted marks-empty">
+                  输入词句即可在当前书籍全文中检索，点击结果直接跳到对应段落。
+                </p>
+              )}
+
+              <div className="search-hit-list">
+                {searchResult.hits.map((hit) => (
+                  <button
+                    key={`${hit.paraIndex}-${hit.start}`}
+                    type="button"
+                    className={'search-hit' + (hit.index === activeHitIndex ? ' active' : '')}
+                    onClick={() => jumpToSearchHit(hit.index)}
+                  >
+                    <span className="search-hit-meta">
+                      {hit.chapterTitle ? `${hit.chapterTitle} · ` : ''}第 {hit.paraIndex + 1} 段
+                    </span>
+                    <span className="search-hit-snippet">
+                      {hit.before}
+                      <mark className="search-mark">{hit.match}</mark>
+                      {hit.after}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </aside>
+          </>
+        )}
+
         {marksOpen && (
           <>
             <div className="toc-mask marks-mask" onClick={() => setMarksOpen(false)} aria-hidden="true" />
             <BookmarkPanel
+              key={marksTab}
+              initialTab={marksTab}
               items={bms.items}
               total={bms.total}
               page={bms.page}
@@ -747,11 +1237,166 @@ export default function ReaderView() {
                 gotoParagraph(paraIndex)
                 ra.stopAutoScroll()
               }}
+              annotations={anns.items}
+              onUpdateAnnotation={(id, patch) => void anns.update(id, patch)}
+              onDeleteAnnotation={(id) => void anns.remove(id)}
+              onExportAnnotations={onExportBookMarkdown}
             />
           </>
         )}
 
-        {/* 翻页时扫过的一页纸：key 变了就重挂，动画从头播（B6） */}
+        {/* 划词悬浮工具条 */}
+        {pendingSel && (
+          <div
+            className="sel-toolbar"
+            style={{ top: pendingSel.top, left: pendingSel.left }}
+            role="dialog"
+            aria-label="划线与批注"
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            <div className="sel-colors" role="group" aria-label="划线颜色">
+              {HIGHLIGHT_COLORS.map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className={`sel-color sel-color-${c.id}` + (selColor === c.id ? ' on' : '')}
+                  title={c.label}
+                  aria-label={c.label}
+                  aria-pressed={selColor === c.id}
+                  onClick={() => setSelColor(c.id)}
+                />
+              ))}
+            </div>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              onClick={() => void saveSelectionAnnotation(null)}
+            >
+              划线
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={() => setSelNoteOpen((v) => !v)}
+            >
+              写批注
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={() => {
+                void navigator.clipboard?.writeText(pendingSel.quote).catch(() => {})
+                setToast('已复制选中文字')
+                setPendingSel(null)
+              }}
+            >
+              复制
+            </button>
+
+            {selNoteOpen && (
+              <div className="sel-note-box" onMouseDown={(e) => e.stopPropagation()}>
+                <textarea
+                  className="input ann-textarea"
+                  rows={3}
+                  autoFocus
+                  placeholder="写下你的批注…"
+                  value={selNoteText}
+                  onChange={(e) => setSelNoteText(e.target.value)}
+                />
+                <div className="ann-edit-acts">
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    onClick={() => void saveSelectionAnnotation(selNoteText.trim() || null)}
+                  >
+                    保存批注
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => setSelNoteOpen(false)}
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 点击已划线文本后的批注气泡 */}
+        {activeAnn && (
+          <div
+            className="ann-popover"
+            style={{ top: activeAnn.top, left: activeAnn.left }}
+            role="dialog"
+            aria-label="批注详情"
+          >
+            <div className="ann-popover-head">
+              <div className="sel-colors">
+                {HIGHLIGHT_COLORS.map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    className={`sel-color sel-color-${c.id}` + (activeAnn.item.color === c.id ? ' on' : '')}
+                    title={c.label}
+                    aria-label={c.label}
+                    onClick={async () => {
+                      const updated = await anns.update(activeAnn.item.annotationId, { color: c.id })
+                      if (updated) setActiveAnn({ ...activeAnn, item: updated })
+                    }}
+                  />
+                ))}
+              </div>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => setActiveAnn(null)}
+              >
+                关闭
+              </button>
+            </div>
+            <p className="ann-popover-quote">「{activeAnn.item.quote}」</p>
+            <textarea
+              className="input ann-textarea"
+              rows={3}
+              placeholder="补充或修改批注…"
+              value={activeAnnNote}
+              onChange={(e) => setActiveAnnNote(e.target.value)}
+            />
+            <div className="ann-popover-foot">
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={async () => {
+                  const updated = await anns.update(activeAnn.item.annotationId, {
+                    note: activeAnnNote.trim() || null,
+                  })
+                  if (updated) {
+                    setToast('批注已更新')
+                    setActiveAnn(null)
+                  }
+                }}
+              >
+                保存批注
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={async () => {
+                  const ok = await anns.remove(activeAnn.item.annotationId)
+                  if (ok) {
+                    setToast('已删除这条划线')
+                    setActiveAnn(null)
+                  }
+                }}
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        )}
+
         {curl && <span key={curl.key} className={'page-curl ' + curl.dir} aria-hidden="true" />}
 
         <div
@@ -759,8 +1404,11 @@ export default function ReaderView() {
           ref={rootRef}
           onClick={onReaderClick}
         >
-          <article className="reader-content" style={{ fontSize: `${prefs.fontSize}px` }}>
-            {/* 窗口上方用撑高块占位，保持滚动条长度正确 */}
+          <article
+            className="reader-content"
+            style={{ fontSize: `${prefs.fontSize}px` }}
+            onMouseUp={onContentMouseUp}
+          >
             {virtual && (
               <div
                 style={{ height: geom.offsets[win.start] }}
@@ -770,27 +1418,167 @@ export default function ReaderView() {
             )}
             {visibleParagraphs.map((p) => {
               const refs = imageByPara.get(p.paraIndex) ?? []
-              const images = refs.map(ref => (
-                <LazyImage key={ref.imageId} docId={docId} imageId={ref.imageId}
-                  alt={ref.alt ?? ''} hasRemote={!!ref.imageUrl} scrollRoot={rootRef}
-                  keepResident={ra.playing} />
+              const images = refs.map((ref) => (
+                <LazyImage
+                  key={ref.imageId}
+                  docId={docId}
+                  imageId={ref.imageId}
+                  alt={ref.alt ?? ''}
+                  hasRemote={!!ref.imageUrl}
+                  scrollRoot={rootRef}
+                  keepResident={ra.playing}
+                />
               ))
-              // 同一段可能有多张图，父容器承载锚点与整段高度，避免只记录最后一张图。
-              const block = p.type === 'img'
-                ? (images.length ? images : <figure className="doc-figure"><div className="figure-missing">这一段的图片引用缺失</div></figure>)
-                : p.type === 'h1' || p.type === 'h2'
-                  ? (() => {
-                      const Tag = p.type
-                      return <Tag className={'doc-' + p.type + (flashPara === p.paraIndex ? ' para-flash' : '')}>{p.text}</Tag>
-                    })()
-                  : <p className={'doc-p' + (flashPara === p.paraIndex ? ' para-flash' : '')}>
-                      {(byPara.get(p.paraIndex) ?? []).map(s => (
-                        <span key={s.sentenceIndex} data-sentence={s.sentenceIndex}
-                          className={'sent' + (s.sentenceIndex === ra.cursor ? ' sent-active' : '')}
-                          onClick={() => ra.seek(s.sentenceIndex)}>{s.text}</span>
-                      ))}
-                    </p>
-              return <div key={p.paraIndex} data-para={p.paraIndex}>{block}{p.type !== 'img' && images}</div>
+              const paraHits = hitsByPara.get(p.paraIndex) ?? []
+              const paraAnns = anns.byPara.get(p.paraIndex) ?? []
+
+              const block =
+                p.type === 'img' ? (
+                  images.length ? (
+                    images
+                  ) : (
+                    <figure className="doc-figure">
+                      <div className="figure-missing">这一段的图片引用缺失</div>
+                    </figure>
+                  )
+                ) : p.type === 'h1' || p.type === 'h2' ? (
+                  (() => {
+                    const Tag = p.type
+                    const headingSpans: SearchSpan[] = paraHits.map((h) => ({
+                      start: h.start,
+                      end: h.end,
+                      active: h.hitIndex === activeHitIndex,
+                    }))
+                    const segs = sliceTextSegments(p.text, [], headingSpans)
+                    return (
+                      <Tag className={'doc-' + p.type + (flashPara === p.paraIndex ? ' para-flash' : '')}>
+                        {segs.map((seg) =>
+                          seg.searchMatch ? (
+                            <mark
+                              key={seg.start}
+                              className={'search-mark' + (seg.searchActive ? ' search-mark-active' : '')}
+                            >
+                              {seg.text}
+                            </mark>
+                          ) : (
+                            seg.text
+                          ),
+                        )}
+                      </Tag>
+                    )
+                  })()
+                ) : (
+                  (() => {
+                    const paraSents = byPara.get(p.paraIndex) ?? []
+                    let renderOffset = 0
+                    return (
+                      <p className={'doc-p' + (flashPara === p.paraIndex ? ' para-flash' : '')}>
+                        {paraSents.map((s) => {
+                          const sentRenderStart = renderOffset
+                          const sentRenderEnd = renderOffset + s.text.length
+                          renderOffset = sentRenderEnd
+
+                          const hlSpans: HighlightSpan[] = []
+                          for (const ann of paraAnns) {
+                            const hs = Math.max(sentRenderStart, ann.anchor.charOffset)
+                            const he = Math.min(sentRenderEnd, ann.endOffset)
+                            if (he > hs) {
+                              hlSpans.push({
+                                start: hs - sentRenderStart,
+                                end: he - sentRenderStart,
+                                annotationId: ann.annotationId,
+                                color: ann.color,
+                                hasNote: !!ann.note,
+                              })
+                            }
+                          }
+
+                          const searchSpans: SearchSpan[] = []
+                          if (paraHits.length > 0) {
+                            const directAligned = p.text.slice(s.startOffset, s.endOffset) === s.text
+                            if (directAligned) {
+                              for (const h of paraHits) {
+                                const ss = Math.max(s.startOffset, h.start)
+                                const se = Math.min(s.endOffset, h.end)
+                                if (se > ss) {
+                                  searchSpans.push({
+                                    start: ss - s.startOffset,
+                                    end: se - s.startOffset,
+                                    active: h.hitIndex === activeHitIndex,
+                                  })
+                                }
+                              }
+                            } else if (searchResult.query) {
+                              const needle = searchResult.query.toLocaleLowerCase()
+                              const hay = s.text.toLocaleLowerCase()
+                              let pos = 0
+                              while (pos <= hay.length - needle.length) {
+                                const f = hay.indexOf(needle, pos)
+                                if (f < 0) break
+                                searchSpans.push({
+                                  start: f,
+                                  end: f + needle.length,
+                                  active: paraHits.some((h) => h.hitIndex === activeHitIndex),
+                                })
+                                pos = f + needle.length
+                              }
+                            }
+                          }
+
+                          const segs = sliceTextSegments(s.text, hlSpans, searchSpans)
+
+                          return (
+                            <span
+                              key={s.sentenceIndex}
+                              data-sentence={s.sentenceIndex}
+                              className={'sent' + (s.sentenceIndex === ra.cursor ? ' sent-active' : '')}
+                              onClick={() => {
+                                const sel = window.getSelection()
+                                if (sel && !sel.isCollapsed) return
+                                ra.seek(s.sentenceIndex)
+                              }}
+                            >
+                              {segs.length === 1 && !segs[0].annotationId && !segs[0].searchMatch
+                                ? s.text
+                                : segs.map((seg) => {
+                                    if (!seg.annotationId && !seg.searchMatch) return seg.text
+                                    const cls = [
+                                      seg.annotationId ? `hl-mark hl-${seg.color}` : '',
+                                      seg.hasNote ? 'hl-has-note' : '',
+                                      seg.searchMatch ? 'search-mark' : '',
+                                      seg.searchActive ? 'search-mark-active' : '',
+                                    ]
+                                      .filter(Boolean)
+                                      .join(' ')
+                                    return (
+                                      <mark
+                                        key={seg.start}
+                                        className={cls}
+                                        data-ann-id={seg.annotationId ?? undefined}
+                                        onClick={
+                                          seg.annotationId
+                                            ? (e) => openAnnotationPopover(e, seg.annotationId!)
+                                            : undefined
+                                        }
+                                      >
+                                        {seg.text}
+                                      </mark>
+                                    )
+                                  })}
+                            </span>
+                          )
+                        })}
+                      </p>
+                    )
+                  })()
+                )
+
+              return (
+                <div key={p.paraIndex} data-para={p.paraIndex}>
+                  {block}
+                  {p.type !== 'img' && images}
+                </div>
+              )
             })}
             {virtual && (
               <div
@@ -804,12 +1592,6 @@ export default function ReaderView() {
           </article>
         </div>
 
-        {/* 收起控制条后浮在正文底部的胶囊，也是唯一的恢复入口。
-            挂在 .reader-body 里而不是 .reader-page 下：.reader-page 没有
-            position:relative，absolute 会去找更外层的定位祖先、跑到页面外边去；
-            .reader-body 才是最近的定位祖先，bottom 也就落在正文区底部。
-            .toast 是 fixed 的 z-80 / bottom:96px，与这里既不重叠也不抢层；
-            .reader-scroll 底部自带 60px 内边距，正文最后一行不会被它盖住 */}
         {barHidden && (
           <button
             ref={restoreBarRef}
@@ -823,9 +1605,9 @@ export default function ReaderView() {
         )}
       </div>
 
-      {(ra.error || bms.error) && (
+      {(ra.error || bms.error || anns.error) && (
         <div className="resume-hint resume-error">
-          {ra.error || bms.error}
+          {ra.error || bms.error || anns.error}
           {bms.conflicts.length > 0 && (
             <button className="btn btn-primary btn-sm" onClick={() => setDialogOpen(true)}>
               查看冲突
@@ -841,10 +1623,13 @@ export default function ReaderView() {
         </div>
       )}
 
-      {/* .playbar 是 flex:none 的普通 flex 子项（不是 fixed），抽掉之后
-          .reader-body 靠 flex:1 自动补满，不需要动任何 padding */}
       {!barHidden && (
-        <PlaybackBar total={sentences.length} ra={ra} onCollapse={() => setBarHidden(true)} />
+        <PlaybackBar
+          total={sentences.length}
+          ra={ra}
+          onPlayFromCurrent={onPlayFromCurrent}
+          onCollapse={() => setBarHidden(true)}
+        />
       )}
 
       {dialogOpen && bms.conflicts.length > 0 && (
@@ -855,7 +1640,7 @@ export default function ReaderView() {
         />
       )}
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   )
 }

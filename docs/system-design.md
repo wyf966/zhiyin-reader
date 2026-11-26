@@ -1,6 +1,6 @@
 # 知音漫卷 · 系统设计
 
-> 版本：1.8.0　｜　最后更新：2026-11-10
+> 版本：2.0.0　｜　最后更新：2026-11-26
 >
 > 本文回答「系统是什么、为什么这样设计」。
 > 开发环境、代码地图、实现约定与测试流程见 [system-develop.md](./system-develop.md)；
@@ -153,7 +153,7 @@ TTS 上游（二选一，经服务端代理）
 
 ## 4. 数据模型
 
-**表的权威定义是 [`server/sql/schema.sql`](../server/sql/schema.sql)**，共 13 张表。
+**表的权威定义是 [`server/sql/schema.sql`](../server/sql/schema.sql)**，共 14 张表。
 以下只记设计意图与关键字段，字段细节以建库脚本为准。
 
 | 表 | 用途 | 关键点 |
@@ -171,6 +171,7 @@ TTS 上游（二选一，经服务端代理）
 | `T_Favorite` | 收藏 | 主键 `(user_id, doc_id)`，双向操作幂等 |
 | `T_ReadingSession` | 阅读时长会话 | `client_id` 唯一索引 + `INSERT OR IGNORE`，离线补报天然幂等 |
 | `T_UserProfile` | 用户档案 | 头像地址单独一张表，避免为加列而重建已有库 |
+| `T_Annotation` | 划线与批注 | 复用标准 `Anchor` 与 `chapter_title`，额外记录 `end_offset`、`quote`、`note`、`color` 与软删除墓碑 |
 
 **锚点（Anchor）只有一种定义**：
 
@@ -291,6 +292,11 @@ type Anchor = {
 | | `GET /api/bookmarks/page?docId=&sort=&order=&page=&pageSize=` | 界面分页列表 |
 | | `GET /api/bookmarks/overview` | 跨文档书签总览 |
 | | `POST /api/bookmarks/reorder` | 整表重排拖动顺序 |
+| 摘录 | `GET /api/annotations?docId=` | 单文档划线与批注列表 |
+| | `GET /api/annotations/overview` | 跨文档摘录总览（按书分组，供查看与导出 Markdown） |
+| | `POST /api/annotations` | 新增划线或批注 |
+| | `PATCH /api/annotations/:annotationId` | 修改批注内容或划线颜色 |
+| | `DELETE /api/annotations/:annotationId` | 软删除划线/批注（刷新 `updated_at`） |
 | 同步 | `POST /api/sync` | 上传增量 + 拉取增量 + 冲突判定 |
 | | `GET /api/sync/conflicts` | 读回未决冲突 |
 | | `POST /api/sync/resolve` | 读者裁决 |

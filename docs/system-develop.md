@@ -1,6 +1,6 @@
 # 知音漫卷 · 系统开发
 
-> 版本：1.8.0　｜　最后更新：2026-11-10
+> 版本：2.0.0　｜　最后更新：2026-11-26
 >
 > 本文回答「怎么开发、怎么避坑、现在做到哪」。
 > 系统架构、数据模型、接口语义见 [system-design.md](./system-design.md)；
@@ -12,10 +12,10 @@
 
 | 项 | 现状 |
 |---|---|
-| 版本 | 客户端与服务端 `1.8.0`；Android 壳的 `versionCode / versionName` 由 CI 从 git tag 算出（本机默认 10 / 1.9.0） |
-| 功能 | 导入解析、图文混排、逐句跟读、跨设备同步与冲突、收藏、阅读时长、头像、书签排序与总览、网页 / 原生更新提示、一键同步、GitHub Releases 分发与自更新 |
-| 数据库 | 13 张表，权威定义 `server/sql/schema.sql` |
-| 测试 | 服务端 284 项 + 客户端 241 项 + 端到端 64 项 = **589 项** |
+| 版本 | 客户端与服务端 `2.0.0`；Android 壳的 `versionCode / versionName` 由 CI 从 git tag 算出（`v2.0.0` → `20000 / 2.0.0`） |
+| 功能 | 导入解析、图文混排、逐句跟读（本机续听 / 从当前段开始 / 读完本章停止 / 定时停止）、书内搜索、划线批注与 Markdown 导出、真正的离线书单与断网重开、跨设备同步与冲突、收藏、阅读时长、头像、书签排序与总览、书架继续阅读横幅、网页 / 原生更新提示、一键同步、GitHub Releases 分发与自更新 |
+| 数据库 | 14 张表，权威定义 `server/sql/schema.sql` |
+| 测试 | 服务端 286 项 + 客户端 255 项 + 端到端 68 项 = **609 项** |
 | 技术栈 | React 18 + Vite + TypeScript；Fastify 4 + better-sqlite3；SQLite |
 | 运行环境 | Node.js 20+；桌面浏览器窗口 ≥ 1280px |
 | 演示服务器 | **已停用**（原 `123.56.172.230`）；本地或自建服务器运行，见 §2.1 |
@@ -610,4 +610,12 @@ CI（GitHub Actions）三个 job 并行：`static`（两端类型检查 + 前端
 
 `GET /api/reading-time/summary?timeZone=<IANA 时区>` 按读者时区计算当天零点与周一零点，支持夏令时；旧客户端未传时区时保留 UTC，非法时区返回 400。新版客户端发送浏览器系统时区。跨日会话仍按开始日期归类。
 
-「最近阅读」按当前读者跨设备 `MAX(T_ReadingProgress.updated_at)` 降序；同时间按导入时间、docId 稳定排序，分页与搜索沿用原查询。
+「最近阅读」按当前读者跨设备 `MAX(T_ReadingProgress.updated_at)` 降序；同时间按导入时间、docId 稳定排序，分页与搜索沿用原查询。`GET /api/documents` 的 `progress` 同时附带 `chapterTitle`（当前进度所在章节标题），供书架顶部「继续阅读」横幅展示。
+
+## 2026-11-26 产品与前端完善记录
+
+- **书内搜索与命中跳转**：`client/src/features/render/inBookSearch.ts` + `textSegments.ts`，在阅读器目录旁新增「书内搜索」抽屉（快捷键 `/` 或 `Ctrl/Cmd+F`），展示章节与前后上下文，支持点击定位与上一处/下一处切换。
+- **续听与睡前听书**：`client/src/features/readalong/listenMemory.ts` 按 `[apiBase, userId, docId]` 隔离在 `localStorage` 记住本机上次听到的句子（不参与跨端同步）；播放条新增「从当前段开始」，并在二级面板提供「读完本章后自动停止」（由真实播放结束事件判定跨章）与定时停止（15/30/45/60 分）。
+- **真正的离线书单**：IndexedDB 升级至 `v7`（追加 `offline` store，不清空既有缓存），新增 `client/src/features/cache/offlineBooks.ts`。已下载书的正文置 `pinned=true` 避免普通 24h TTL/LRU 淘汰，同时缓存插图并如实展示正文与插图保存状态。在线打开仍先向服务端验权（401/403/404 立刻清缓存并拒访问）；仅在断网（`status === 0`）且当前读者有对应隔离离线副本时允许离线会话恢复并重开。
+- **划线、批注与导出 Markdown**：`server/sql/schema.sql` 追加第 14 张表 `T_Annotation`（老库启动自动建表，无需重建），新增 `/api/annotations` 与 `/api/annotations/overview`。阅读器支持选词划线/批注、点击高亮编辑与删除；书签侧栏增加「摘录」页签，书架「我的书签」旁新增「我的摘录」，支持按书或全部导出 `.md`。
+- **界面与键盘体验优化**：书架顶部新增「继续阅读」横幅（显示书名、章名与进度）；播放条主条突出上一句 / 播放·暂停 / 下一句 / 从当前段开始，将引擎、音色、语速、降级详情与睡前定时收进「声音与定时」二级面板；补齐阅读快捷键（`Space`、`←/→`、`/`、`T/B/S`、`Esc`）、面板焦点归还、书架卡片键盘操作与 `:focus-visible` 焦点环。

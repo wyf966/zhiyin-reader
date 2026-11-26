@@ -319,14 +319,17 @@ test.describe('阅读界面（ReaderView）', () => {
     await openDemoBook(page)
     const bar = page.locator('.playbar')
 
-    // 本机没装 Kokoro → 应当给出降级说明。
-    // 注意条上可能有**两个** .pb-note：音色缺失数量 + 降级说明
-    // （PlaybackBar.tsx:121-135），所以按文字定位，不能只取 .pb-note。
-    await expect(bar.locator('.pb-note').filter({ hasText: '已降级为设备发声' })).toBeVisible()
-    // 目录里 8 个中文音色本机都没装。本地引擎整个没起来时没有服务端引擎条目能
-    // 认领这批音色，8848f0e 曾把它们一起丢掉（下拉框空着、这条提示也不出现）。
-    // engines/index.ts 现在把它们挂到浏览器原生那条兜底项上，这里钉住。
-    await expect(bar.locator('.pb-note').filter({ hasText: '需安装离线音色包' })).toBeVisible()
+    // 本机没装 Kokoro → 主条显示紧凑的「设备发声」徽标，
+    // 完整降级说明与离线音色包详情收在「声音与定时」二级面板里。
+    await expect(bar.locator('.pb-chip-warn')).toContainText('设备发声')
+    const moreBtn = bar.getByRole('button', { name: /声音与定时/ })
+    await moreBtn.click()
+    const popover = bar.locator('.pb-popover')
+    await expect(popover).toBeVisible()
+    await expect(popover.locator('.pb-note').filter({ hasText: '已降级为设备发声' })).toBeVisible()
+    await expect(popover.locator('.pb-note').filter({ hasText: '需安装离线音色包' })).toBeVisible()
+    await popover.getByRole('button', { name: '完成' }).click()
+    await expect(popover).toBeHidden()
 
     /**
      * 无头 Linux 的 chromium 上没有语音合成后端（除非装了 speech-dispatcher 一类），

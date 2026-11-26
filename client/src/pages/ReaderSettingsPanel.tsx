@@ -141,6 +141,17 @@ export default function ReaderSettingsPanel({
         )}
         <p className="set-note">背景图只存在这台设备的浏览器里，不会上传。</p>
       </div>
+
+      <div className="set-group">
+        <div className="set-label">快捷键</div>
+        <ul className="set-keys">
+          <li><kbd>空格</kbd><span>播放 / 暂停跟读</span></li>
+          <li><kbd>←</kbd> / <kbd>→</kbd><span>上一句 / 下一句</span></li>
+          <li><kbd>/</kbd> 或 <kbd>Ctrl+F</kbd><span>书内搜索</span></li>
+          <li><kbd>T</kbd> / <kbd>B</kbd> / <kbd>S</kbd><span>目录 / 书签 / 设置</span></li>
+          <li><kbd>Esc</kbd><span>关闭当前面板</span></li>
+        </ul>
+      </div>
     </aside>
   )
 }

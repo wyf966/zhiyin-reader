@@ -8,10 +8,13 @@ export type BookFormat = 'EPUB' | 'TXT' | 'MD'
 
 /** 阅读进度摘要（契约 §4.4）。R5 接入 T_ReadingProgress 之前恒为 null */
 export interface ProgressSummary {
-  paraIndex: number
+  paragraphIndex?: number
+  paraIndex?: number
   /** 0–1 */
   percent: number
   updatedAt: string
+  /** 当前进度所在章节标题（供书架「继续阅读」展示） */
+  chapterTitle?: string | null
 }
 
 /** 书架里的一本书 —— 对应 GET /api/documents 的 items 元素 */

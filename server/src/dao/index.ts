@@ -152,6 +152,22 @@ export interface IdempotencyRow {
   created_at: string
 }
 
+/** 划线与批注（T_Annotation） */
+export interface AnnotationRow {
+  annotation_id: string
+  user_id: string
+  doc_id: string
+  anchor_json: string
+  end_offset: number
+  quote: string
+  note: string | null
+  color: string
+  chapter_title: string | null
+  created_at: string
+  updated_at: string
+  deleted_at: string | null
+}
+
 /* -------------------------------------------------------------- 工具 */
 
 export function newId(prefix: string): string {
@@ -1174,6 +1190,140 @@ export class DataAccessLibrary {
           ORDER BY doc_id ASC, sort_order ASC, bookmark_id ASC`,
       )
       .all(userId, ...docIds) as BookmarkRow[]
+  }
+
+  /** 取某段落及之前最近一个标题段（h1/h2）；之前没有时退回文档首个标题段 */
+  getChapterTitleAt(docId: string, paraIndex: number): string | null {
+    const db = getDb()
+    const prev = db
+      .prepare(
+        `SELECT text FROM T_Paragraph
+          WHERE doc_id = ? AND para_type IN ('h1', 'h2') AND para_index <= ?
+          ORDER BY para_index DESC LIMIT 1`,
+      )
+      .get(docId, paraIndex) as { text: string } | undefined
+    if (prev) return prev.text
+    const first = db
+      .prepare(
+        `SELECT text FROM T_Paragraph
+          WHERE doc_id = ? AND para_type IN ('h1', 'h2')
+          ORDER BY para_index ASC LIMIT 1`,
+      )
+      .get(docId) as { text: string } | undefined
+    return first?.text ?? null
+  }
+
+  /* ---- 划线与批注（T_Annotation） ---- */
+
+  getAnnotationById(annotationId: string): AnnotationRow | undefined {
+    return getDb()
+      .prepare('SELECT * FROM T_Annotation WHERE annotation_id = ?')
+      .get(annotationId) as AnnotationRow | undefined
+  }
+
+  insertAnnotation(row: AnnotationRow): AnnotationRow {
+    getDb()
+      .prepare(
+        `INSERT INTO T_Annotation
+           (annotation_id, user_id, doc_id, anchor_json, end_offset, quote,
+            note, color, chapter_title, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.annotation_id, row.user_id, row.doc_id, row.anchor_json, row.end_offset,
+        row.quote, row.note, row.color, row.chapter_title, row.created_at, row.updated_at, row.deleted_at,
+      )
+    return this.getAnnotationById(row.annotation_id)!
+  }
+
+  updateAnnotation(
+    annotationId: string,
+    fields: { note?: string | null; color?: string; updated_at: string },
+  ): AnnotationRow | undefined {
+    const sets: string[] = ['updated_at = ?']
+    const params: unknown[] = [fields.updated_at]
+    if (fields.note !== undefined) {
+      sets.push('note = ?')
+      params.push(fields.note)
+    }
+    if (fields.color !== undefined) {
+      sets.push('color = ?')
+      params.push(fields.color)
+    }
+    params.push(annotationId)
+    getDb()
+      .prepare(`UPDATE T_Annotation SET ${sets.join(', ')} WHERE annotation_id = ? AND deleted_at IS NULL`)
+      .run(...params)
+    return this.getAnnotationById(annotationId)
+  }
+
+  /** 软删除必须同时刷新 updated_at */
+  softDeleteAnnotation(annotationId: string, deletedAt: string): boolean {
+    const r = getDb()
+      .prepare(
+        'UPDATE T_Annotation SET deleted_at = ?, updated_at = ? WHERE annotation_id = ? AND deleted_at IS NULL',
+      )
+      .run(deletedAt, deletedAt, annotationId)
+    return r.changes > 0
+  }
+
+  listAnnotationsByDocument(userId: string, docId: string): AnnotationRow[] {
+    return getDb()
+      .prepare(
+        `SELECT * FROM T_Annotation
+          WHERE user_id = ? AND doc_id = ? AND deleted_at IS NULL
+          ORDER BY created_at ASC, annotation_id ASC`,
+      )
+      .all(userId, docId) as AnnotationRow[]
+  }
+
+  listAnnotatedDocuments(
+    userId: string,
+    page: number,
+    pageSize: number,
+  ): {
+    total: number
+    docs: { doc_id: string; doc_title: string | null; doc_author: string | null; file_name: string }[]
+  } {
+    const total = (
+      getDb()
+        .prepare(
+          `SELECT COUNT(DISTINCT doc_id) AS n FROM T_Annotation
+            WHERE user_id = ? AND deleted_at IS NULL`,
+        )
+        .get(userId) as { n: number }
+    ).n
+
+    const docs = getDb()
+      .prepare(
+        `SELECT a.doc_id AS doc_id, d.title AS doc_title, d.author AS doc_author, d.file_name AS file_name
+           FROM T_Annotation a
+           JOIN T_Document d ON d.doc_id = a.doc_id
+          WHERE a.user_id = ? AND a.deleted_at IS NULL
+          GROUP BY a.doc_id
+          ORDER BY MAX(a.updated_at) DESC, a.doc_id ASC
+          LIMIT ? OFFSET ?`,
+      )
+      .all(userId, pageSize, (page - 1) * pageSize) as {
+      doc_id: string
+      doc_title: string | null
+      doc_author: string | null
+      file_name: string
+    }[]
+
+    return { total, docs }
+  }
+
+  listAnnotationsByDocIds(userId: string, docIds: string[]): AnnotationRow[] {
+    if (docIds.length === 0) return []
+    const placeholders = docIds.map(() => '?').join(', ')
+    return getDb()
+      .prepare(
+        `SELECT * FROM T_Annotation
+          WHERE user_id = ? AND deleted_at IS NULL AND doc_id IN (${placeholders})
+          ORDER BY doc_id ASC, created_at ASC, annotation_id ASC`,
+      )
+      .all(userId, ...docIds) as AnnotationRow[]
   }
 }
 

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { Paragraph } from '../../models/types'
 import type { Sentence } from './splitSentences'
 import {
   createEngine,
@@ -11,6 +12,12 @@ import {
 import { readReadAlongPrefs, writeReadAlongPrefs } from './readAlongPrefs'
 import { speakWithPreload } from './speakWithPreload'
 import { NATIVE_ENGINE_ID } from './engines/nativeTts'
+import {
+  firstSentenceIndexForParagraph,
+  isChapterBoundary,
+  readListenCursor,
+  writeListenCursor,
+} from './listenMemory'
 
 /**
  * 逐句跟读的编排。
@@ -45,10 +52,22 @@ export interface ReadAlongApi {
   realAudio: boolean
   /** 服务端有引擎但不可用，界面上要说明为什么降级了 */
   degraded: boolean
+  /** 是否开启「读完本章停止」 */
+  stopAfterChapter: boolean
+  /** 定时停止档位（分钟），0 表示关闭 */
+  sleepMinutes: number
+  /** 定时停止剩余秒数，null 表示未开启 */
+  sleepRemainingSec: number | null
+  /** 自动停播后的轻提示（如读完本章 / 定时到点） */
+  stopNotice: string
+  /** 是否从本机记忆恢复了上次听到的句子 */
+  restoredFromMemory: boolean
 
   toggle: () => void
   pause: () => void
   seek: (index: number) => void
+  /** 从当前阅读段落的首句开始跟读 */
+  playFromParagraph: (paraIndex: number) => boolean
   prev: () => void
   next: () => void
   /** 从当前位置继续，并恢复自动滚动 */
@@ -58,9 +77,17 @@ export interface ReadAlongApi {
   setRate: (r: number) => void
   setVoice: (v: string) => void
   setEngine: (id: string) => void
+  setStopAfterChapter: (enabled: boolean) => void
+  setSleepTimer: (minutes: number) => void
+  clearStopNotice: () => void
 }
 
-export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi {
+export function useReadAlong(
+  docId: string,
+  sentences: Sentence[],
+  paragraphs: Paragraph[] = [],
+  memoryKey = '',
+): ReadAlongApi {
   /** 上次用的引擎/音色/语速，只在挂载时读一次；之后以 state 为准 */
   const stored = useMemo(readReadAlongPrefs, [])
 
@@ -74,8 +101,79 @@ export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi
   const [cursor, setCursor] = useState(0)
   const [autoScroll, setAutoScroll] = useState(true)
   const [error, setError] = useState('')
+  const [stopAfterChapter, setStopAfterChapterState] = useState(false)
+  const [sleepMinutes, setSleepMinutes] = useState(0)
+  const [sleepDeadline, setSleepDeadline] = useState<number | null>(null)
+  const [sleepRemainingSec, setSleepRemainingSec] = useState<number | null>(null)
+  const [stopNotice, setStopNotice] = useState('')
+  const [restoredFromMemory, setRestoredFromMemory] = useState(false)
   /** 每次"跳转/重播"都 +1，让播放循环从新位置重启 */
   const [runId, setRunId] = useState(0)
+
+  const stopAfterChapterRef = useRef(stopAfterChapter)
+  const paragraphsRef = useRef(paragraphs)
+  const sleepDeadlineRef = useRef<number | null>(sleepDeadline)
+  const memoryKeyRef = useRef(memoryKey)
+  const restoredForKeyRef = useRef('')
+
+  useEffect(() => {
+    stopAfterChapterRef.current = stopAfterChapter
+  }, [stopAfterChapter])
+  useEffect(() => {
+    paragraphsRef.current = paragraphs
+  }, [paragraphs])
+  useEffect(() => {
+    sleepDeadlineRef.current = sleepDeadline
+  }, [sleepDeadline])
+  useEffect(() => {
+    memoryKeyRef.current = memoryKey
+  }, [memoryKey])
+
+  /**
+   * 打开一本书拿到句子后，若本机记住过上次听到的句子，自动把游标恢复过去。
+   * 未听过的书保持第 0 句；同一本书只恢复一次，避免覆盖读者手动点选。
+   */
+  useEffect(() => {
+    if (!memoryKey || sentences.length === 0) return
+    if (restoredForKeyRef.current === memoryKey) return
+    restoredForKeyRef.current = memoryKey
+    const saved = readListenCursor(memoryKey)
+    if (saved !== null && saved > 0 && saved < sentences.length) {
+      cursorRef.current = saved
+      setCursor(saved)
+      setRestoredFromMemory(true)
+    } else {
+      cursorRef.current = 0
+      setCursor(0)
+      setRestoredFromMemory(false)
+    }
+  }, [memoryKey, sentences.length])
+
+  /**
+   * 定时停止倒计时：仅用于刷新面板里的剩余分钟并在到点时暂停，
+   * 绝不触碰游标（游标推进只由真实播放结束事件驱动）。
+   */
+  useEffect(() => {
+    if (sleepDeadline === null) {
+      setSleepRemainingSec(null)
+      return
+    }
+    const tick = () => {
+      const leftMs = sleepDeadline - Date.now()
+      if (leftMs <= 0) {
+        setSleepDeadline(null)
+        setSleepMinutes(0)
+        setSleepRemainingSec(null)
+        setPlaying(false)
+        setStopNotice('定时时间到，已自动停止跟读。')
+        return
+      }
+      setSleepRemainingSec(Math.ceil(leftMs / 1000))
+    }
+    tick()
+    const timer = window.setInterval(tick, 1000)
+    return () => window.clearInterval(timer)
+  }, [sleepDeadline])
 
   /**
    * C3：语速走 ref，**不进播放循环的依赖数组**。
@@ -240,7 +338,29 @@ export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi
         const nextIdx = Math.min(i + 1, sentences.length - 1)
         cursorRef.current = nextIdx
         setCursor(nextIdx)
+        if (memoryKeyRef.current) writeListenCursor(memoryKeyRef.current, nextIdx)
         setError('')
+
+        // 睡前听书：读完本章停止 —— 在真实播放结束事件之后判定跨章边界
+        if (
+          stopAfterChapterRef.current &&
+          i + 1 < sentences.length &&
+          isChapterBoundary(paragraphsRef.current, sentences[i].paraIndex, sentences[i + 1].paraIndex)
+        ) {
+          setPlaying(false)
+          setStopNotice('已读完本章，自动停止跟读。')
+          return
+        }
+
+        // 若定时已到期，本句念完后立即收手
+        if (sleepDeadlineRef.current !== null && Date.now() >= sleepDeadlineRef.current) {
+          setSleepDeadline(null)
+          setSleepMinutes(0)
+          setSleepRemainingSec(null)
+          setPlaying(false)
+          setStopNotice('定时时间到，已自动停止跟读。')
+          return
+        }
       }
       // 全文念完
       if (!ac.signal.aborted) setPlaying(false)
@@ -275,6 +395,8 @@ export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi
       const clamped = Math.max(0, Math.min(sentences.length - 1, index))
       cursorRef.current = clamped
       setCursor(clamped)
+      setRestoredFromMemory(false)
+      if (memoryKeyRef.current) writeListenCursor(memoryKeyRef.current, clamped)
       setRunId((n) => n + 1) // 正在播的话，循环从新位置重启
     },
     [sentences.length],
@@ -282,9 +404,13 @@ export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi
 
   const toggle = useCallback(() => {
     setError('')
+    setStopNotice('')
     setAutoScroll(true)
     setPlaying((p) => {
-      if (!p) setRunId((n) => n + 1)
+      if (!p) {
+        if (memoryKeyRef.current) writeListenCursor(memoryKeyRef.current, cursorRef.current)
+        setRunId((n) => n + 1)
+      }
       return !p
     })
   }, [])
@@ -298,7 +424,27 @@ export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi
     [seek],
   )
 
+  /** 从当前阅读段落的首句开始跟读 */
+  const playFromParagraph = useCallback(
+    (paraIndex: number): boolean => {
+      const target = firstSentenceIndexForParagraph(sentences, paraIndex)
+      if (target === null) return false
+      setError('')
+      setStopNotice('')
+      setAutoScroll(true)
+      setRestoredFromMemory(false)
+      cursorRef.current = target
+      setCursor(target)
+      if (memoryKeyRef.current) writeListenCursor(memoryKeyRef.current, target)
+      setRunId((n) => n + 1)
+      setPlaying(true)
+      return true
+    },
+    [sentences],
+  )
+
   const resume = useCallback(() => {
+    setStopNotice('')
     setAutoScroll(true)
     setRunId((n) => n + 1)
     setPlaying(true)
@@ -311,6 +457,30 @@ export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi
     setError('')
     setPlaying(false)
   }, [])
+
+  const setStopAfterChapter = useCallback((enabled: boolean) => {
+    stopAfterChapterRef.current = enabled
+    setStopAfterChapterState(enabled)
+    if (enabled) setStopNotice('')
+  }, [])
+
+  const setSleepTimer = useCallback((minutes: number) => {
+    const clean = Math.max(0, Math.floor(minutes))
+    setSleepMinutes(clean)
+    setStopNotice('')
+    if (clean <= 0) {
+      sleepDeadlineRef.current = null
+      setSleepDeadline(null)
+      setSleepRemainingSec(null)
+    } else {
+      const deadline = Date.now() + clean * 60_000
+      sleepDeadlineRef.current = deadline
+      setSleepDeadline(deadline)
+      setSleepRemainingSec(clean * 60)
+    }
+  }, [])
+
+  const clearStopNotice = useCallback(() => setStopNotice(''), [])
 
   return {
     ready: engines !== null,
@@ -326,10 +496,16 @@ export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi
     voiceCatalog,
     realAudio: currentOption?.realAudio ?? false,
     degraded: engines?.serverEngineDown ?? false,
+    stopAfterChapter,
+    sleepMinutes,
+    sleepRemainingSec,
+    stopNotice,
+    restoredFromMemory,
 
     toggle,
     pause,
     seek: holdAt,
+    playFromParagraph,
     prev: () => holdAt(cursorRef.current - 1),
     next: () => holdAt(cursorRef.current + 1),
     resume,
@@ -337,5 +513,8 @@ export function useReadAlong(docId: string, sentences: Sentence[]): ReadAlongApi
     setRate,
     setVoice,
     setEngine: changeEngine,
+    setStopAfterChapter,
+    setSleepTimer,
+    clearStopNotice,
   }
 }

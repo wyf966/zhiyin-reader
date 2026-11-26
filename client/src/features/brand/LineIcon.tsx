@@ -10,7 +10,10 @@ export type LineIconName =
   | 'image'
   | 'headphones'
   | 'bookmark'
+  | 'quote'
   | 'cloud'
+  | 'download'
+  | 'search'
   | 'puzzle'
   | 'wifi'
   | 'shelf'
@@ -55,6 +58,24 @@ export default function LineIcon({ name, size = 20, className }: Props) {
       )}
       {name === 'bookmark' && (
         <path d="M7 4.4h10a1 1 0 0 1 1 1v14.3l-6-3.6-6 3.6V5.4a1 1 0 0 1 1-1Z" />
+      )}
+      {name === 'quote' && (
+        <>
+          <path d="M5 6.5h14M5 11.5h10M5 16.5h7" />
+          <path d="m15.5 14.5 3.5-3.5 1.8 1.8-3.5 3.5-2.3.5.5-2.3Z" />
+        </>
+      )}
+      {name === 'download' && (
+        <>
+          <path d="M12 4.5v10.5M8.2 11.5 12 15.3l3.8-3.8" />
+          <path d="M4.8 18.8h14.4" />
+        </>
+      )}
+      {name === 'search' && (
+        <>
+          <circle cx="10.8" cy="10.8" r="6.2" />
+          <path d="m15.6 15.6 4.2 4.2" />
+        </>
       )}
       {name === 'cloud' && (
         <>

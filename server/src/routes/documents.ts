@@ -59,6 +59,7 @@ function toListItem(
           paragraphIndex: latest.paragraph_index,
           percent,
           updatedAt: latest.updated_at,
+          chapterTitle: dal.getChapterTitleAt(d.doc_id, latest.paragraph_index),
         }
       : null,
   }

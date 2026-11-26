@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { BookmarkDto } from '../api/client'
+import type { AnnotationColor, AnnotationDto, BookmarkDto } from '../api/client'
 
 /**
  * 书签面板（B1）。从 ReaderView 抽出来独立成文件 —— ReaderView 已是全项目最大的
@@ -25,6 +25,12 @@ interface Props {
   sort: 'order' | 'createdAt' | 'chapter'
   onSortChange: (s: 'order' | 'createdAt' | 'chapter') => void
   onPageChange: (p: number) => void
+  /** 划线与批注（在「书签」旁增加「摘录」页签并支持导出 Markdown） */
+  annotations?: AnnotationDto[]
+  onUpdateAnnotation?: (annotationId: string, patch: { note?: string | null; color?: AnnotationColor }) => void
+  onDeleteAnnotation?: (annotationId: string) => void
+  onExportAnnotations?: () => void
+  initialTab?: 'bookmarks' | 'annotations'
 }
 
 /** 超过这个像素数才算拖动，避免把手柄上的单击误判成拖拽 */
@@ -44,7 +50,15 @@ export default function BookmarkPanel({
   sort,
   onSortChange,
   onPageChange,
+  annotations = [],
+  onUpdateAnnotation,
+  onDeleteAnnotation,
+  onExportAnnotations,
+  initialTab = 'bookmarks',
 }: Props) {
+  const [tab, setTab] = useState<'bookmarks' | 'annotations'>(initialTab)
+  const [editingAnnId, setEditingAnnId] = useState('')
+  const [editingNote, setEditingNote] = useState('')
   const [addOpen, setAddOpen] = useState(false)
   const [addName, setAddName] = useState('')
   const [renamingId, setRenamingId] = useState('')
@@ -213,21 +227,143 @@ export default function BookmarkPanel({
   }
 
   return (
-    <aside className="toc-panel marks-panel">
+    <aside className="toc-panel marks-panel" aria-label="书签与摘录">
       <div className="toc-head toc-head-row">
-        <span>书签</span>
-        <button
-          className="btn btn-ghost btn-sm"
-          onClick={() => {
-            setAddOpen((v) => !v)
-            setAddName('')
-          }}
-        >
-          加当前位置
-        </button>
+        <div className="panel-tabs" role="tablist" aria-label="书签或摘录">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'bookmarks'}
+            className={'panel-tab' + (tab === 'bookmarks' ? ' on' : '')}
+            onClick={() => setTab('bookmarks')}
+          >
+            书签{total > 0 ? `（${total}）` : ''}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'annotations'}
+            className={'panel-tab' + (tab === 'annotations' ? ' on' : '')}
+            onClick={() => setTab('annotations')}
+          >
+            摘录{annotations.length > 0 ? `（${annotations.length}）` : ''}
+          </button>
+        </div>
+
+        {tab === 'bookmarks' ? (
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => {
+              setAddOpen((v) => !v)
+              setAddName('')
+            }}
+          >
+            加当前位置
+          </button>
+        ) : (
+          onExportAnnotations && (
+            <button
+              className="btn btn-ghost btn-sm"
+              disabled={annotations.length === 0}
+              onClick={onExportAnnotations}
+              title="将本书所有划线与批注导出为 Markdown"
+            >
+              导出 MD
+            </button>
+          )
+        )}
       </div>
 
-      {addOpen && (
+      {tab === 'annotations' && (
+        <div className="ann-panel-body">
+          {annotations.length === 0 && (
+            <p className="muted marks-empty">
+              还没有划线或批注。在正文中拖动选中文字，即可保存划线或写批注。
+            </p>
+          )}
+          <div className="ann-list">
+            {annotations.map((ann) => (
+              <div className={`ann-card ann-color-${ann.color}`} key={ann.annotationId}>
+                <button
+                  type="button"
+                  className="ann-jump"
+                  onClick={() => onJump(ann.anchor.paragraphIndex)}
+                  title="定位到这段原文"
+                >
+                  <span className="ann-quote">{ann.quote}</span>
+                  <span className="ann-meta">
+                    {ann.chapterTitle ? `${ann.chapterTitle} · ` : ''}第 {ann.anchor.paragraphIndex + 1} 段
+                  </span>
+                </button>
+
+                {editingAnnId === ann.annotationId ? (
+                  <div className="ann-edit-box">
+                    <textarea
+                      className="input ann-textarea"
+                      rows={3}
+                      autoFocus
+                      placeholder="写下你的批注…"
+                      value={editingNote}
+                      onChange={(e) => setEditingNote(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') setEditingAnnId('')
+                      }}
+                    />
+                    <div className="ann-edit-acts">
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        onClick={() => {
+                          onUpdateAnnotation?.(ann.annotationId, { note: editingNote.trim() || null })
+                          setEditingAnnId('')
+                        }}
+                      >
+                        保存
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setEditingAnnId('')}
+                      >
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  ann.note && <p className="ann-note">{ann.note}</p>
+                )}
+
+                <div className="ann-card-foot">
+                  <span className="muted">{new Date(ann.createdAt).toLocaleDateString('zh-CN')}</span>
+                  <div className="ann-card-acts">
+                    <button
+                      type="button"
+                      className="mark-act"
+                      title="编辑批注"
+                      onClick={() => {
+                        setEditingAnnId(ann.annotationId)
+                        setEditingNote(ann.note ?? '')
+                      }}
+                    >
+                      ✎
+                    </button>
+                    <button
+                      type="button"
+                      className="mark-act"
+                      title="删除摘录"
+                      onClick={() => onDeleteAnnotation?.(ann.annotationId)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {tab === 'bookmarks' && addOpen && (
         <div className="marks-add">
           <input
             className="input mark-rename"
@@ -257,11 +393,12 @@ export default function BookmarkPanel({
         </div>
       )}
 
-      {items.length === 0 && (
+      {tab === 'bookmarks' && items.length === 0 && (
         <p className="muted marks-empty">还没有书签。读到某处点「加当前位置」。</p>
       )}
 
-      <div className="marks-list" ref={listRef}>
+      {tab === 'bookmarks' && (
+        <div className="marks-list" ref={listRef}>
         {shown.map((b, index) => (
           <div
             className={'mark-item' + (draggingId === b.bookmarkId ? ' dragging' : '')}
@@ -337,8 +474,9 @@ export default function BookmarkPanel({
           </div>
         ))}
       </div>
+      )}
 
-      {total > 0 && (
+      {tab === 'bookmarks' && total > 0 && (
         <div className="marks-pager">
           <select
             className="input marks-sort"

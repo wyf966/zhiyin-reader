@@ -9,7 +9,7 @@
  */
 
 export const DB_NAME = 'zhiyin-cache'
-export const DB_VERSION = 6
+export const DB_VERSION = 7
 
 export const STORE_DOCUMENTS = 'documents'
 export const STORE_IMAGES = 'images'
@@ -21,6 +21,8 @@ export const STORE_PENDING = 'pending'
  * 二进制**不上传服务端** —— 它是读者偏好，不是文档内容，不该跟着文档走。
  */
 export const STORE_READER_BG = 'readerbg'
+/** 离线书单清单：记录每本已显式下载离线阅读的书及其正文/插图保存状态 */
+export const STORE_OFFLINE = 'offline'
 
 export type StoreName =
   | typeof STORE_DOCUMENTS
@@ -28,6 +30,7 @@ export type StoreName =
   | typeof STORE_AUDIO
   | typeof STORE_PENDING
   | typeof STORE_READER_BG
+  | typeof STORE_OFFLINE
 
 let dbPromise: Promise<IDBDatabase | null> | null = null
 
@@ -74,6 +77,9 @@ export function openCacheDb(): Promise<IDBDatabase | null> {
       if (!db.objectStoreNames.contains(STORE_READER_BG)) {
         // 只有一条记录，固定主键，换图即覆盖，不留孤儿
         db.createObjectStore(STORE_READER_BG, { keyPath: 'id' })
+      }
+      if (!db.objectStoreNames.contains(STORE_OFFLINE)) {
+        db.createObjectStore(STORE_OFFLINE, { keyPath: 'key' })
       }
     }
 

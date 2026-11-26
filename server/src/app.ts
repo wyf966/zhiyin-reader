@@ -9,6 +9,7 @@ import resourceRoutes from './routes/resources'
 import ttsRoutes from './routes/tts'
 import progressRoutes from './routes/progress'
 import bookmarkRoutes from './routes/bookmarks'
+import annotationRoutes from './routes/annotations'
 import readingTimeRoutes from './routes/readingTime'
 import syncRoutes from './routes/sync'
 import healthRoutes from './routes/health'
@@ -174,6 +175,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await app.register(ttsRoutes)
   await app.register(progressRoutes)
   await app.register(bookmarkRoutes)
+  await app.register(annotationRoutes)
   await app.register(readingTimeRoutes)
   await app.register(syncRoutes)
 

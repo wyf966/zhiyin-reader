@@ -226,3 +226,25 @@ CREATE TABLE IF NOT EXISTS T_UserProfile (
   avatar_url TEXT,
   updated_at TEXT NOT NULL
 );
+
+-- (14) 划线与批注表（追加新表，不改动已有表，老库启动自动建表）----------------
+-- 锚点复用标准 Anchor 结构（anchor_json.paragraphIndex + anchor_json.charOffset 为起始偏移），
+-- 章节定位复用 chapter_title；end_offset 为段内结束偏移（UTF-16 code unit）。
+CREATE TABLE IF NOT EXISTS T_Annotation (
+  annotation_id TEXT PRIMARY KEY,
+  user_id       TEXT NOT NULL REFERENCES T_User(user_id) ON DELETE CASCADE,
+  doc_id        TEXT NOT NULL REFERENCES T_Document(doc_id) ON DELETE CASCADE,
+  anchor_json   TEXT NOT NULL,
+  end_offset    INTEGER NOT NULL,
+  quote         TEXT NOT NULL,
+  note          TEXT,
+  color         TEXT NOT NULL DEFAULT 'amber',
+  chapter_title TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  deleted_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_annotation_user_doc
+  ON T_Annotation(user_id, doc_id, deleted_at, created_at);
+CREATE INDEX IF NOT EXISTS ix_annotation_user_updated
+  ON T_Annotation(user_id, updated_at);

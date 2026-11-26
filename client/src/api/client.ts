@@ -457,6 +457,31 @@ export interface BookmarkDto {
   chapterTitle?: string | null
 }
 
+/** 划线与批注颜色 */
+export type AnnotationColor = 'amber' | 'sage' | 'ink' | 'rose'
+
+/** 划线与批注 DTO */
+export interface AnnotationDto {
+  annotationId: string
+  docId: string
+  anchor: Anchor
+  endOffset: number
+  quote: string
+  note: string | null
+  color: AnnotationColor
+  chapterTitle: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface AnnotationGroup {
+  docId: string
+  docTitle: string
+  docAuthor: string
+  annotationCount: number
+  items: AnnotationDto[]
+}
+
 /** 契约 §8.3 的冲突信封 */
 export interface ConflictEnvelope {
   scope: 'progress' | 'bookmark'
@@ -901,4 +926,47 @@ export const api = {
     request<{ serverTime: string; items: ConflictEnvelope[] }>(
       `/sync/conflicts${docId ? `?docId=${encodeURIComponent(docId)}` : ''}`,
     ),
+
+  /* 划线与批注 */
+
+  listAnnotations: (docId: string) =>
+    request<{ docId: string; items: AnnotationDto[] }>(
+      `/annotations?docId=${encodeURIComponent(docId)}`,
+    ),
+
+  listAnnotationsOverview: (opts: { page?: number; pageSize?: number } = {}) => {
+    const q = new URLSearchParams()
+    if (opts.page) q.set('page', String(opts.page))
+    if (opts.pageSize) q.set('pageSize', String(opts.pageSize))
+    const qs = q.toString()
+    return request<{ total: number; page: number; pageSize: number; groups: AnnotationGroup[] }>(
+      `/annotations/overview${qs ? '?' + qs : ''}`,
+    )
+  },
+
+  createAnnotation: (body: {
+    annotationId?: string
+    docId: string
+    anchor: Anchor
+    endOffset: number
+    quote: string
+    note?: string | null
+    color?: AnnotationColor
+    chapterTitle?: string | null
+  }) =>
+    request<AnnotationDto>('/annotations', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  patchAnnotation: (annotationId: string, body: { note?: string | null; color?: AnnotationColor }) =>
+    request<AnnotationDto>(`/annotations/${annotationId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  deleteAnnotation: (annotationId: string) =>
+    request<{ annotationId: string; deletedAt: string }>(`/annotations/${annotationId}`, {
+      method: 'DELETE',
+    }),
 }

@@ -1,9 +1,23 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ApiError, api, type BookmarkDto } from '../api/client'
+import { ApiError, api, type AnnotationDto, type AnnotationGroup, type BookmarkDto } from '../api/client'
+import type { Book } from '../models/types'
 import { parseFile } from '../features/parse'
 import { assertImageScope, imageScope } from '../features/render/imageCache'
 import { cacheParsedImages, migrateLegacyHash } from '../features/render/restoreImages'
+import {
+  downloadBookForOffline,
+  formatBytes,
+  formatOfflineStatus,
+  listOfflineBooks,
+  removeOfflineBook,
+  type OfflineBookRecord,
+} from '../features/cache/offlineBooks'
+import {
+  downloadMarkdownFile,
+  formatAllAnnotationsMarkdown,
+  formatBookAnnotationsMarkdown,
+} from '../features/annotations/exportMarkdown'
 import UserAvatar from '../features/profile/UserAvatar'
 import LineIcon, { type LineIconName } from '../features/brand/LineIcon'
 import { usePointerGlow } from '../features/motion/usePointerGlow'
@@ -11,13 +25,14 @@ import ThemeToggle from '../features/settings/ThemeToggle'
 import { useSession } from '../state/session'
 import { pendingSyncCount, syncAllPending } from '../features/sync/oneClickSync'
 
-type NavKey = 'all' | 'recent' | 'favorite' | 'bookmarks' | 'offline'
+type NavKey = 'all' | 'recent' | 'favorite' | 'bookmarks' | 'annotations' | 'offline'
 
 const NAV: { key: NavKey; label: string; category: string; icon: LineIconName }[] = [
   { key: 'all', label: '全部书籍', category: 'all', icon: 'shelf' },
   { key: 'recent', label: '最近阅读', category: 'recent', icon: 'clock' },
   { key: 'favorite', label: '我的收藏', category: 'favorite', icon: 'star' },
   { key: 'bookmarks', label: '我的书签', category: 'bookmarked', icon: 'bookmark' },
+  { key: 'annotations', label: '我的摘录', category: 'annotations', icon: 'quote' },
   { key: 'offline', label: '离线文档', category: 'offline', icon: 'cloud' },
 ]
 
@@ -126,10 +141,48 @@ export default function LibraryView() {
   /** 底部操作栏是否处于"确认删除"态 */
   const [confirmBatch, setConfirmBatch] = useState(false)
 
+  /** 书架顶部「继续阅读」横条：最近阅读的第一本书 */
+  const [recentTop, setRecentTop] = useState<Book | null>(null)
+
+  /** 本机离线书单：按 docId 映射，同时驱动卡片状态与「离线文档」分类 */
+  const [offlineList, setOfflineList] = useState<OfflineBookRecord[]>([])
+  const [offlineDownloading, setOfflineDownloading] = useState<Record<string, string>>({})
+
+  /** 我的摘录（跨书划线与批注总览） */
+  const [annGroups, setAnnGroups] = useState<AnnotationGroup[]>([])
+  const [annLoading, setAnnLoading] = useState(false)
+  const [annPage, setAnnPage] = useState(1)
+  const [annTotal, setAnnTotal] = useState(0)
+  const [annError, setAnnError] = useState('')
+  const [annEditingId, setAnnEditingId] = useState('')
+  const [annEditingText, setAnnEditingText] = useState('')
+  const [pendingAnnDelete, setPendingAnnDelete] = useState<string | null>(null)
+  const [annBusy, setAnnBusy] = useState(false)
+
   const fileRef = useRef<HTMLInputElement>(null)
   const supplementDoc = useRef<string | null>(null)
   const navigate = useNavigate()
-  const { user, ready, logout } = useSession()
+  const { user, ready, offline, retrySession, logout } = useSession()
+
+  const offlineByDoc = new Map(offlineList.map((r) => [r.docId, r]))
+
+  const refreshOffline = useCallback(async () => {
+    if (!user) return
+    try {
+      setOfflineList(await listOfflineBooks(user.userId))
+    } catch {
+      setOfflineList([])
+    }
+  }, [user])
+
+  useEffect(() => {
+    void refreshOffline()
+  }, [refreshOffline])
+
+  /* 断网恢复进入书架时，默认切到离线文档，避免对着网络报错发呆 */
+  useEffect(() => {
+    if (offline && nav === 'all') setNav('offline')
+  }, [offline, nav])
 
   /* 未登录先去登录页；ready 之前不要跳，否则刷新页面会被踢出去 */
   useEffect(() => {
@@ -161,7 +214,13 @@ export default function LibraryView() {
   const category = NAV.find((n) => n.key === nav)?.category ?? 'all'
 
   const load = useCallback(async () => {
-    if (!user || nav === 'bookmarks') return
+    if (!user || nav === 'bookmarks' || nav === 'annotations') return
+    if (nav === 'offline') {
+      setLoading(false)
+      setError('')
+      await refreshOffline()
+      return
+    }
     const requestVersion = ++loadVersion.current
     setLoading(true)
     setError('')
@@ -176,12 +235,26 @@ export default function LibraryView() {
       if (!items.length && bookPage > 1) { setBookPage(bookPage - 1); return }
       setBookTotal(total)
       setBooks(items)
+
+      // 同步拉取最近阅读的第一本，用于顶部「继续阅读」入口（显示书名 + 当前章名）
+      if ((nav === 'all' || nav === 'recent') && !keyword.trim()) {
+        if (nav === 'recent') {
+          setRecentTop(items[0] ?? null)
+        } else {
+          void api
+            .listDocuments({ page: 1, pageSize: 1, category: 'recent' })
+            .then((r) => {
+              if (requestVersion === loadVersion.current) setRecentTop(r.items[0] ?? null)
+            })
+            .catch(() => {})
+        }
+      }
     } catch (e) {
       if (requestVersion === loadVersion.current) setError(e instanceof ApiError ? e.message : '加载书架失败，请稍后重试。')
     } finally {
       if (requestVersion === loadVersion.current) setLoading(false)
     }
-  }, [user, keyword, category, nav, bookPage])
+  }, [user, keyword, category, nav, bookPage, refreshOffline])
 
   useEffect(() => {
     const t = window.setTimeout(() => void load(), keyword ? 300 : 0)
@@ -214,6 +287,102 @@ export default function LibraryView() {
   useEffect(() => {
     void loadOverview()
   }, [loadOverview])
+
+  /* 我的摘录：跨文档划线与批注总览 */
+  const loadAnnotations = useCallback(async () => {
+    if (!user || nav !== 'annotations') return
+    setAnnLoading(true)
+    setAnnError('')
+    try {
+      const r = await api.listAnnotationsOverview({ page: annPage, pageSize: 20 })
+      if (r.groups.length === 0 && annPage > 1) {
+        setAnnPage(annPage - 1)
+        return
+      }
+      setAnnGroups(r.groups)
+      setAnnTotal(r.total)
+    } catch (e) {
+      setAnnError(e instanceof ApiError ? e.message : '加载摘录失败，请稍后重试。')
+    } finally {
+      setAnnLoading(false)
+    }
+  }, [user, nav, annPage])
+
+  useEffect(() => {
+    void loadAnnotations()
+  }, [loadAnnotations])
+
+  async function onDownloadOffline(docId: string, title: string) {
+    if (offlineDownloading[docId]) return
+    setOfflineDownloading((prev) => ({ ...prev, [docId]: '下载正文…' }))
+    setNotice(null)
+    try {
+      const rec = await downloadBookForOffline(docId, (p) => {
+        if (p.stage === 'images' && p.total > 0) {
+          setOfflineDownloading((prev) => ({ ...prev, [docId]: `插图 ${p.done + 1}/${p.total}` }))
+        }
+      })
+      await refreshOffline()
+      setNotice({ kind: 'done', text: `《${shortTitle(title)}》已下载：${formatOfflineStatus(rec)}` })
+    } catch (e) {
+      setNotice({
+        kind: 'failed',
+        text: e instanceof ApiError ? e.message : `下载《${shortTitle(title)}》失败，请稍后重试。`,
+      })
+    } finally {
+      setOfflineDownloading((prev) => {
+        const next = { ...prev }
+        delete next[docId]
+        return next
+      })
+    }
+  }
+
+  async function onRemoveOffline(docId: string, title: string) {
+    try {
+      await removeOfflineBook(docId)
+      await refreshOffline()
+      setNotice({ kind: 'done', text: `已将《${shortTitle(title)}》移出离线书单。` })
+    } catch {
+      setNotice({ kind: 'failed', text: '移除离线副本失败，请稍后重试。' })
+    }
+  }
+
+  async function onSaveAnnNote(ann: AnnotationDto) {
+    setAnnBusy(true)
+    setNotice(null)
+    try {
+      await api.patchAnnotation(ann.annotationId, { note: annEditingText.trim() || null })
+      setAnnEditingId('')
+      setNotice({ kind: 'done', text: '批注已更新。' })
+      await loadAnnotations()
+    } catch (e) {
+      setNotice({
+        kind: 'failed',
+        text: e instanceof ApiError ? e.message : '更新批注失败，请稍后重试。',
+      })
+    } finally {
+      setAnnBusy(false)
+    }
+  }
+
+  async function onDeleteAnnotation(ann: AnnotationDto) {
+    setAnnBusy(true)
+    setNotice(null)
+    try {
+      await api.deleteAnnotation(ann.annotationId)
+      setPendingAnnDelete(null)
+      setNotice({ kind: 'done', text: '已删除该条摘录。' })
+      await loadAnnotations()
+    } catch (e) {
+      setNotice({
+        kind: 'failed',
+        text: e instanceof ApiError ? e.message : '删除摘录失败，请稍后重试。',
+      })
+    } finally {
+      setAnnBusy(false)
+    }
+  }
 
   const syncBadgeClass =
     syncPhase === 'syncing'
@@ -313,6 +482,8 @@ export default function LibraryView() {
     setNotice(null)
     try {
       await api.deleteDocument(docId)
+      await removeOfflineBook(docId).catch(() => {})
+      await refreshOffline()
       setPendingDelete(null)
       setNotice({ kind: 'done', text: `已删除《${shown}》，正文、书签与阅读进度一并清除。` })
       await load()
@@ -708,6 +879,61 @@ export default function LibraryView() {
         </aside>
 
         <main className="shelf-main">
+          {offline && (
+            <div className="parse-bar" role="status">
+              <span>当前处于离线模式，可直接打开下方已下载的离线书籍。</span>
+              <button
+                className="btn btn-ghost btn-sm parse-open"
+                onClick={() => setNav('offline')}
+              >
+                查看离线文档
+              </button>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => void retrySession()}
+              >
+                重试连网
+              </button>
+            </div>
+          )}
+
+          {/* 书架顶部「继续阅读」入口：保留纸面气质，直接显示最近一本书与当前章节名 */}
+          {(nav === 'all' || nav === 'recent') && !keyword.trim() && recentTop && !loading && !error && (
+            <section className="continue-card" aria-label="继续阅读">
+              <div
+                className="continue-swatch"
+                data-cover={coverIndexFor(recentTop.docId, recentTop.title)}
+                aria-hidden="true"
+              >
+                <span>{recentTop.title.trim().charAt(0) || '书'}</span>
+              </div>
+              <div className="continue-info">
+                <div className="continue-eyebrow">继续阅读</div>
+                <div className="continue-title" title={recentTop.title}>{recentTop.title}</div>
+                <div className="continue-chapter">
+                  {recentTop.progress?.chapterTitle || '正文开始处'}
+                  <span className="continue-dot">·</span>
+                  已读 {Math.round((recentTop.progress?.percent ?? 0) * 100)}%
+                </div>
+                <div className="book-progress continue-progress">
+                  <div
+                    className="book-progress-fill"
+                    style={{ width: `${Math.round((recentTop.progress?.percent ?? 0) * 100)}%` }}
+                  />
+                </div>
+              </div>
+              <div className="continue-actions">
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => navigate(`/read/${recentTop.docId}`)}
+                >
+                  继续阅读
+                </button>
+              </div>
+            </section>
+          )}
+
           {stage.kind !== 'idle' && (
             <div className={'parse-bar' + (stage.kind === 'done' ? ' done' : stage.kind === 'error' ? ' failed' : '')}>
               {stage.kind === 'parsing' && <span>正在解析「{stage.fileName}」…</span>}
@@ -982,9 +1208,291 @@ export default function LibraryView() {
             </div>
           )}
 
+          {nav === 'annotations' && (
+            <div className="marks-overview">
+              {annLoading && <div className="shelf-empty">正在加载摘录…</div>}
+
+              {!annLoading && annError && (
+                <div className="shelf-empty">
+                  <p className="error-text">{annError}</p>
+                  <button className="btn btn-primary" onClick={() => void loadAnnotations()}>
+                    重试
+                  </button>
+                </div>
+              )}
+
+              {!annLoading && !annError && annGroups.length === 0 && (
+                <div className="shelf-empty">
+                  <p>还没有任何划线与批注</p>
+                  <p className="muted">打开一本书，在正文中拖动选中文字即可划线或写批注</p>
+                </div>
+              )}
+
+              {!annLoading && !annError && annGroups.length > 0 && (
+                <>
+                  <div className="marks-overview-bar">
+                    <span className="muted">共 {annTotal} 本书有摘录</span>
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      onClick={() => {
+                        const md = formatAllAnnotationsMarkdown(annGroups)
+                        downloadMarkdownFile('知音漫卷-全部摘录', md)
+                        setNotice({ kind: 'done', text: '已导出全部摘录为 Markdown。' })
+                      }}
+                    >
+                      导出全部 Markdown
+                    </button>
+                  </div>
+
+                  {annGroups.map((g) => (
+                    <section className="marks-group" key={g.docId}>
+                      <header className="marks-group-head ann-group-head">
+                        <span className="marks-group-title">{g.docTitle}</span>
+                        <span className="muted">{g.annotationCount} 条</span>
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm ann-group-export"
+                          onClick={() => {
+                            const md = formatBookAnnotationsMarkdown(
+                              { title: g.docTitle, author: g.docAuthor },
+                              g.items,
+                            )
+                            downloadMarkdownFile(`${g.docTitle}-摘录`, md)
+                            setNotice({ kind: 'done', text: `已导出《${shortTitle(g.docTitle)}》的 Markdown 摘录。` })
+                          }}
+                        >
+                          导出 Markdown
+                        </button>
+                      </header>
+
+                      {g.items.map((a) => (
+                        <div className={`marks-row ann-overview-row ann-color-${a.color}`} key={a.annotationId}>
+                          <div className="ann-overview-body">
+                            <button
+                              type="button"
+                              className="marks-row-main"
+                              onClick={() =>
+                                navigate(`/read/${a.docId}?para=${a.anchor.paragraphIndex}`)
+                              }
+                            >
+                              <span className="ann-quote">{a.quote}</span>
+                              <span className="marks-row-chapter">
+                                {a.chapterTitle
+                                  ? `${a.chapterTitle} · 第 ${a.anchor.paragraphIndex + 1} 段`
+                                  : `${g.docTitle} · 第 ${a.anchor.paragraphIndex + 1} 段`}
+                              </span>
+                              <span className="marks-row-time">
+                                {new Date(a.createdAt).toLocaleString('zh-CN')}
+                              </span>
+                            </button>
+
+                            {annEditingId === a.annotationId ? (
+                              <div className="ann-edit-box">
+                                <textarea
+                                  className="input ann-textarea"
+                                  rows={2}
+                                  autoFocus
+                                  placeholder="写下批注…"
+                                  value={annEditingText}
+                                  onChange={(e) => setAnnEditingText(e.target.value)}
+                                />
+                                <div className="ann-edit-acts">
+                                  <button
+                                    type="button"
+                                    className="btn btn-primary btn-sm"
+                                    disabled={annBusy}
+                                    onClick={() => void onSaveAnnNote(a)}
+                                  >
+                                    保存
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-ghost btn-sm"
+                                    onClick={() => setAnnEditingId('')}
+                                  >
+                                    取消
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              a.note && <p className="ann-note">{a.note}</p>
+                            )}
+                          </div>
+
+                          <div className="marks-row-acts">
+                            <button
+                              type="button"
+                              className="mark-act"
+                              title="编辑批注"
+                              disabled={annBusy}
+                              onClick={() => {
+                                setAnnEditingId(a.annotationId)
+                                setAnnEditingText(a.note ?? '')
+                              }}
+                            >
+                              ✎
+                            </button>
+                            <button
+                              type="button"
+                              className="mark-act"
+                              title="删除摘录"
+                              disabled={annBusy}
+                              onClick={() => setPendingAnnDelete(a.annotationId)}
+                            >
+                              ✕
+                            </button>
+                          </div>
+
+                          {pendingAnnDelete === a.annotationId && (
+                            <div className="marks-row-confirm">
+                              <span className="muted">删除这条摘录？</span>
+                              <button
+                                type="button"
+                                className="btn btn-sm book-del-danger"
+                                disabled={annBusy}
+                                onClick={() => void onDeleteAnnotation(a)}
+                              >
+                                {annBusy ? '正在删除…' : '确认删除'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-ghost btn-sm"
+                                disabled={annBusy}
+                                onClick={() => setPendingAnnDelete(null)}
+                              >
+                                取消
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </section>
+                  ))}
+
+                  {annTotal > 20 && (
+                    <div className="marks-pager">
+                      <span className="muted">
+                        第 {annPage} / {Math.ceil(annTotal / 20)} 页 · 共 {annTotal} 本
+                      </span>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        disabled={annPage <= 1}
+                        onClick={() => setAnnPage((p) => p - 1)}
+                      >
+                        上一页
+                      </button>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        disabled={annPage >= Math.ceil(annTotal / 20)}
+                        onClick={() => setAnnPage((p) => p + 1)}
+                      >
+                        下一页
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {nav === 'offline' && (() => {
+            const kw = keyword.trim().toLocaleLowerCase()
+            const filtered = kw
+              ? offlineList.filter(
+                  (r) =>
+                    r.doc.title.toLocaleLowerCase().includes(kw) ||
+                    r.doc.author.toLocaleLowerCase().includes(kw),
+                )
+              : offlineList
+
+            if (filtered.length === 0) {
+              return (
+                <div className="shelf-empty">
+                  <p>{kw ? '离线书单里没有匹配的文档' : '还没有下载离线书籍'}</p>
+                  <p className="muted">
+                    在「全部书籍」卡片上点「下载离线」，或在阅读页顶栏点「下载离线」，保存正文和插图后断网也能重新打开
+                  </p>
+                </div>
+              )
+            }
+
+            return (
+              <div className="book-grid">
+                {filtered.map((rec, i) => (
+                  <article
+                    key={rec.docId}
+                    className="book-card"
+                    tabIndex={0}
+                    role="button"
+                    aria-label={`打开离线书籍《${rec.doc.title}》`}
+                    style={{ '--i': i } as CSSProperties}
+                    {...glow}
+                    onClick={() => navigate(`/read/${rec.docId}`)}
+                    onKeyDown={(e) => {
+                      if (e.target !== e.currentTarget) return
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        navigate(`/read/${rec.docId}`)
+                      }
+                    }}
+                  >
+                    <div className="book-cover" data-cover={coverIndexFor(rec.docId, rec.doc.title)}>
+                      <b className="book-cover-mark" aria-hidden="true">
+                        {rec.doc.title.trim().charAt(0) || '书'}
+                      </b>
+                      <i className="book-cover-sheen" aria-hidden="true" />
+                      <i className="book-cover-peel" aria-hidden="true" />
+                      <i className="book-cover-lamp" aria-hidden="true" />
+                      <i className="book-spine" aria-hidden="true" />
+                      <span>{rec.doc.title}</span>
+                      <span className="book-offline-badge">离线</span>
+                    </div>
+                    <div className="book-meta">
+                      <div className="book-title" title={rec.doc.title}>{rec.doc.title}</div>
+                      <div className="book-author">{rec.doc.author}</div>
+                      <div className="offline-status-line" title={formatOfflineStatus(rec)}>
+                        {formatOfflineStatus(rec)}
+                      </div>
+                      <div className="book-foot">
+                        <span className="tag">{rec.doc.fileFormat}</span>
+                        <span className="muted">{formatBytes(rec.bytes)}</span>
+                      </div>
+                      <div className="offline-card-acts">
+                        {!offline && (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            disabled={!!offlineDownloading[rec.docId]}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              void onDownloadOffline(rec.docId, rec.doc.title)
+                            }}
+                          >
+                            {offlineDownloading[rec.docId] || '更新离线'}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void onRemoveOffline(rec.docId, rec.doc.title)
+                          }}
+                        >
+                          移除离线
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )
+          })()}
+
           {/* 加载态：先摆 8 个墨线格子，一根根"画"出来（B3）。
               外层仍然是 .shelf-empty，加载提示也还在，只是多了一层骨架 */}
-          {loading && (
+          {nav !== 'bookmarks' && nav !== 'annotations' && nav !== 'offline' && loading && (
             <div className="shelf-empty shelf-loading">
               <div className="sk-grid" aria-hidden="true">
                 {Array.from({ length: 8 }).map((_, i) => (
@@ -999,32 +1507,26 @@ export default function LibraryView() {
             </div>
           )}
 
-          {!loading && error && (
+          {nav !== 'bookmarks' && nav !== 'annotations' && nav !== 'offline' && !loading && error && (
             <div className="shelf-empty">
               <p className="error-text">{error}</p>
               <button className="btn btn-primary" onClick={() => void load()}>重试</button>
             </div>
           )}
 
-          {nav !== 'bookmarks' && !loading && !error && books.length === 0 && (
+          {nav !== 'bookmarks' && nav !== 'annotations' && nav !== 'offline' && !loading && !error && books.length === 0 && (
             <div className="shelf-empty">
               <p>
-                {/* 没有 bookmarks 分支：上面那层已经把它排除了，
-                    书签总览自带空状态（见上面的 marks-overview） */}
                 {keyword
                   ? '没有匹配的文档'
                   : nav === 'favorite'
                     ? '还没有收藏任何书'
-                    : nav === 'offline'
-                      ? '这里恒为空'
-                      : '书架还是空的'}
+                    : '书架还是空的'}
               </p>
               <p className="muted">
                 {nav === 'favorite'
                   ? '把鼠标移到书封面上，点亮左上角的 ☆ 就收藏了'
-                  : nav === 'offline'
-                    ? '"有本地副本"是纯客户端状态，服务端不可知'
-                    : '点右上角「导入文档」，选一个 EPUB / TXT / Markdown 文件试试'}
+                  : '点右上角「导入文档」，选一个 EPUB / TXT / Markdown 文件试试'}
               </p>
             </div>
           )}
@@ -1041,18 +1543,31 @@ export default function LibraryView() {
             </div>
           )}
 
-          {nav !== 'bookmarks' && !loading && !error && books.length > 0 && (
+          {nav !== 'bookmarks' && nav !== 'annotations' && nav !== 'offline' && !loading && !error && books.length > 0 && (
             <div className="book-grid">
-              {books.map((b, i) => (
+              {books.map((b, i) => {
+                const offRec = offlineByDoc.get(b.docId)
+                const dlText = offlineDownloading[b.docId]
+                return (
                 <article
                   key={b.docId}
                   className="book-card"
+                  tabIndex={0}
+                  role="button"
+                  aria-label={`打开《${b.title}》`}
                   // 序号给 CSS：书是一本一本落架的，不是整页一起冒出来
                   style={{ '--i': i } as CSSProperties}
                   {...glow}
                   // 处于确认删除状态时整卡不再充当"打开这本书"的入口，避免误触跳转
                   onClick={() => {
                     if (pendingDelete !== b.docId) navigate(`/read/${b.docId}`)
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget || pendingDelete === b.docId) return
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      navigate(`/read/${b.docId}`)
+                    }
                   }}
                 >
                   <div className="book-cover" data-cover={coverIndexFor(b.docId, b.title)}>
@@ -1069,6 +1584,7 @@ export default function LibraryView() {
                     {/* 书脊：左边一道窄窄的暗边，抽出时才显出来 */}
                     <i className="book-spine" aria-hidden="true" />
                     <span>{b.title}</span>
+                    {offRec && <span className="book-offline-badge" title={formatOfflineStatus(offRec)}>离线</span>}
 
                     {/* 收藏入口所有分类下都给：它只改"这本收没收藏"，
                         不像删除那样会跟当前视图的语义打架 */}
@@ -1142,22 +1658,46 @@ export default function LibraryView() {
                       />
                     </div>
                     <div className="book-foot">
-                      <span className="tag">{b.fileFormat}</span>
-                      <span className="muted">
-                        {b.progress ? `已读 ${Math.round(b.progress.percent * 100)}%` : `${b.paragraphCount} 段`}
+                      <span className="book-foot-info">
+                        <span className="tag">{b.fileFormat}</span>
+                        <span className="muted">
+                          {b.progress ? `${Math.round(b.progress.percent * 100)}%` : `${b.paragraphCount} 段`}
+                        </span>
                       </span>
+                      <button
+                        type="button"
+                        className={'book-offline-btn' + (offRec ? ' is-saved' : '') + (dlText ? ' is-busy' : '')}
+                        disabled={!!dlText}
+                        title={offRec ? formatOfflineStatus(offRec) : '下载正文与插图以支持离线阅读'}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          if (offRec) void onRemoveOffline(b.docId, b.title)
+                          else void onDownloadOffline(b.docId, b.title)
+                        }}
+                      >
+                        {dlText || (offRec ? '已离线' : '下载离线')}
+                      </button>
                     </div>
-                    {b.hasOriginalFile === false && <button className="btn btn-ghost btn-sm" onClick={e => {
-                      e.stopPropagation()
-                      supplementDoc.current = b.docId
-                      fileRef.current?.click()
-                    }}>选择原文件补传</button>}
+                    {b.hasOriginalFile === false && (
+                      <button
+                        type="button"
+                        className="book-supplement-btn"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          supplementDoc.current = b.docId
+                          fileRef.current?.click()
+                        }}
+                      >
+                        选择原文件补传
+                      </button>
+                    )}
                   </div>
                 </article>
-              ))}
+                )
+              })}
             </div>
           )}
-          {nav !== 'bookmarks' && !loading && !error && bookTotal > 20 && (
+          {nav !== 'bookmarks' && nav !== 'annotations' && nav !== 'offline' && !loading && !error && bookTotal > 20 && (
             <nav className="marks-pager" aria-label="书架分页">
               <span>第 {bookPage} / {Math.ceil(bookTotal / 20)} 页 · 共 {bookTotal} 本</span>
               <button className="btn btn-ghost btn-sm" disabled={bookPage <= 1} onClick={() => setBookPage(p => p - 1)}>上一页</button>

@@ -111,8 +111,6 @@ export default function LoginView() {
 
       <div className="login-panel">
         <form className="login-card" onSubmit={submit}>
-          {/* 玻璃卡上沿的一道反光，跟着卡片常驻；纯装饰，不吃指针事件 */}
-          <span className="login-card-glare" aria-hidden="true" />
           <div className="tabs">
             <button
               type="button"

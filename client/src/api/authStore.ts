@@ -8,6 +8,15 @@
  */
 
 const REFRESH_KEY = 'zhiyin.refreshToken'
+const CACHED_USER_KEY = 'zhiyin.cachedUser'
+
+export interface CachedUserSnapshot {
+  apiBase: string
+  userId: string
+  account: string
+  nickname: string
+  avatarUrl: string | null
+}
 
 export interface TokenPair {
   accessToken: string
@@ -42,6 +51,40 @@ export const authStore = {
   setUser(userId: string | null): void {
     currentUserId = userId
   },
+  getCachedUser(apiBase: string): CachedUserSnapshot | null {
+    if (typeof localStorage === 'undefined') return null
+    try {
+      const raw = localStorage.getItem(CACHED_USER_KEY)
+      if (!raw) return null
+      const parsed = JSON.parse(raw) as Partial<CachedUserSnapshot> | null
+      if (
+        !parsed ||
+        parsed.apiBase !== apiBase ||
+        typeof parsed.userId !== 'string' ||
+        typeof parsed.account !== 'string'
+      ) {
+        return null
+      }
+      return {
+        apiBase: parsed.apiBase,
+        userId: parsed.userId,
+        account: parsed.account,
+        nickname: typeof parsed.nickname === 'string' ? parsed.nickname : parsed.account,
+        avatarUrl: typeof parsed.avatarUrl === 'string' ? parsed.avatarUrl : null,
+      }
+    } catch {
+      return null
+    }
+  },
+  setCachedUser(snapshot: CachedUserSnapshot | null): void {
+    if (typeof localStorage === 'undefined') return
+    try {
+      if (snapshot) localStorage.setItem(CACHED_USER_KEY, JSON.stringify(snapshot))
+      else localStorage.removeItem(CACHED_USER_KEY)
+    } catch {
+      /* 隐私模式写不进去不影响在线使用 */
+    }
+  },
   set(pair: TokenPair): void {
     accessToken = pair.accessToken
     refreshToken = pair.refreshToken
@@ -55,6 +98,7 @@ export const authStore = {
     currentUserId = null
     if (typeof localStorage !== 'undefined') {
       localStorage.removeItem(REFRESH_KEY)
+      localStorage.removeItem(CACHED_USER_KEY)
     }
   },
 }

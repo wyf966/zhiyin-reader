@@ -72,8 +72,14 @@ export default function LazyImage({
       if (!row?.fromOriginal && !restored) {
         try { restored = await restoreImages(scope) }
         catch (e) {
-          if (!(e instanceof ApiError && e.code === 'ORIGINAL_FILE_MISSING')) throw e
-          warning = e.message
+          // 离线阅读时（网络不可达 status=0）如果本地已有缓存图，直接展示本地副本，不阻断离线图文混排
+          if (e instanceof ApiError && e.status === 0 && row?.blob) {
+            warning = ''
+          } else if (e instanceof ApiError && e.code === 'ORIGINAL_FILE_MISSING') {
+            warning = e.message
+          } else {
+            throw e
+          }
         }
         row = await cacheEntry(scope, imageId)
       }
